@@ -94,6 +94,9 @@ def _parse_time_ms(expr: str) -> int:
     return _parse_duration_ms(expr)
 
 
+_ALLOWED_SEVERITIES = frozenset({"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"})
+
+
 def _validate_service(service: str) -> str:
     if not _SERVICE_RE.match(service):
         raise ValueError(
@@ -101,6 +104,15 @@ def _validate_service(service: str) -> str:
             "only alphanumeric, dash, underscore, and dot allowed"
         )
     return service
+
+
+def _validate_severity(severity: str) -> str:
+    sev = severity.upper()
+    if sev not in _ALLOWED_SEVERITIES:
+        raise ValueError(
+            f"Invalid severity {severity!r}: must be one of {sorted(_ALLOWED_SEVERITIES)}"
+        )
+    return sev
 
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
@@ -223,10 +235,10 @@ async def tail_logs(
         List of log dicts with timestamp, severityText, body, and service fields.
     """
     _validate_service(service)
+    sev = _validate_severity(severity)
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
     limit = min(limit, _MAX_LIMIT_RAW)
-    sev = severity.upper()
 
     filter_expr = f"serviceName = '{service}' AND severityText = '{sev}'"
 
@@ -324,7 +336,7 @@ async def list_metrics() -> list[str]:
     """
     data = await client.get("/api/v1/metricsNames")
     names = data if isinstance(data, list) else data.get("data", [])
-    return sorted(names)
+    return sorted(names)[:500]
 
 
 @mcp.tool()

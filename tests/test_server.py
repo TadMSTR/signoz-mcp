@@ -240,6 +240,17 @@ async def test_tail_logs_rejects_invalid_service():
         await tail_logs(service="../../etc/passwd")
 
 
+@pytest.mark.asyncio
+async def test_tail_logs_rejects_invalid_severity():
+    from signoz_mcp.server import tail_logs
+
+    with pytest.raises(ValueError):
+        await tail_logs(service="backend", severity="ERROR' OR 1=1 --")
+
+    with pytest.raises(ValueError):
+        await tail_logs(service="backend", severity="INVALID")
+
+
 # ── count_log_errors ──────────────────────────────────────────────────────────
 
 
@@ -309,6 +320,20 @@ async def test_list_metrics_returns_sorted():
 
     result = await list_metrics()
     assert result == ["cpu_time", "http_requests", "system_mem"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_metrics_capped_at_500():
+    # Generate 600 unique metric names
+    many_names = [f"metric_{i:04d}" for i in range(600)]
+    respx.get("http://localhost:8080/api/v1/metricsNames").mock(
+        return_value=Response(200, json=many_names)
+    )
+    from signoz_mcp.server import list_metrics
+
+    result = await list_metrics()
+    assert len(result) == 500
 
 
 # ── list_alert_rules ──────────────────────────────────────────────────────────
