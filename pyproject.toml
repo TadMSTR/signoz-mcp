@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signoz-mcp"
-version = "0.1.1"
+version = "0.1.2"
 description = "FastMCP server for SigNoz observability queries — read-only access to services, traces, logs, metrics, and alerts"
 readme = "README.md"
 license = "MIT"
