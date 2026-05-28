@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2] — 2026-05-27
+
+### Security
+
+- `query_metric`: validate `metric_name` against `[a-zA-Z0-9._:/-]+` allowlist; raise
+  `ValueError` on invalid input (L1 — security audit forge-observer-mcps-deploy)
+- `query_metric`: cap `label_filter` at 500 chars (L1 — same audit)
+
 ## [0.1.1] — 2026-05-27
 
 ### Added
