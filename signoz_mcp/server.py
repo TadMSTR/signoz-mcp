@@ -33,6 +33,8 @@ from signoz_mcp import _client as client
 _log = structlog.get_logger("signoz-mcp")
 
 _SERVICE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+_METRIC_NAME_RE = re.compile(r"^[a-zA-Z0-9._:/-]+$")
+_MAX_LABEL_FILTER_LEN = 500
 
 _MAX_LIMIT_RAW = 500
 _MAX_LIMIT_AGG = 10_000
@@ -312,6 +314,11 @@ async def query_metric(
     Returns:
         List of time-series dicts with metric labels and values array.
     """
+    if not _METRIC_NAME_RE.match(metric_name):
+        raise ValueError(f"Invalid metric name {metric_name!r}: only alphanumeric, dot, underscore, colon, slash, dash allowed")
+    if label_filter and len(label_filter) > _MAX_LABEL_FILTER_LEN:
+        raise ValueError(f"label_filter too long: max {_MAX_LABEL_FILTER_LEN} chars")
+
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
 
