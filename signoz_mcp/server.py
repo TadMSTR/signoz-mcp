@@ -34,6 +34,9 @@ _log = structlog.get_logger("signoz-mcp")
 
 _SERVICE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _METRIC_NAME_RE = re.compile(r"^[a-zA-Z0-9._:/-]+$")
+# Allowlist for SigNoz label_filter expressions: identifiers, comparisons, string literals,
+# logical operators (AND/OR/IN as plain letters), list brackets, commas, whitespace.
+_LABEL_FILTER_RE = re.compile(r"^[a-zA-Z0-9_.='<>!()\[\]\s,]+$")
 _MAX_LABEL_FILTER_LEN = 500
 
 _MAX_LIMIT_RAW = 500
@@ -317,6 +320,13 @@ async def query_metric(
         raise ValueError(f"Invalid metric name {metric_name!r}: only alphanumeric, dot, underscore, colon, slash, dash allowed")
     if label_filter and len(label_filter) > _MAX_LABEL_FILTER_LEN:
         raise ValueError(f"label_filter too long: max {_MAX_LABEL_FILTER_LEN} chars")
+    # SECURITY[resolved]: Validate label_filter against allowlist regex before passing to
+    # SigNoz query API. LOW-01 from 2026-05-30/signoz-mcp-deploy-2026-05.
+    if label_filter and not _LABEL_FILTER_RE.match(label_filter):
+        raise ValueError(
+            "Invalid label_filter: only alphanumeric, _  .  =  '  <  >  !  ()  []  ,  "
+            "and whitespace allowed"
+        )
 
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
