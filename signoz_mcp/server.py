@@ -121,15 +121,14 @@ def _validate_severity(severity: str) -> str:
 
 
 @mcp.tool()
-async def list_services() -> list[dict]:
-    """List all services registered in SigNoz with their RED metrics.
+async def list_services() -> list[str]:
+    """List all service names registered in SigNoz.
 
     Returns:
-        List of service dicts with name, p99, errorRate, callRate, and numErrors.
+        List of service name strings.
     """
-    data = await client.get("/api/v1/services")
-    services = data if isinstance(data, list) else data.get("data", [])
-    return services[:200]
+    data = await client.get("/api/v1/services/list")
+    return data if isinstance(data, list) else []
 
 
 @mcp.tool()
@@ -354,7 +353,7 @@ async def list_alert_rules() -> list[dict]:
         List of alert rule dicts with name, state, and condition details.
     """
     data = await client.get("/api/v1/rules")
-    rules = data if isinstance(data, list) else data.get("data", [])
+    rules = data if isinstance(data, list) else data.get("data", {}).get("rules", [])
     return rules[:200]
 
 
