@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.3] — 2026-05-30
+
+### Fixed
+
+- `list_services`: corrected endpoint from `/api/v1/services` (returns SPA HTML on v0.118+)
+  to `/api/v1/services/list`; updated return type from `list[dict]` to `list[str]`
+- `list_alert_rules`: fixed data extraction — `/api/v1/rules` returns
+  `{"data":{"rules":[]}}`, not `{"data":[]}`, causing `KeyError` on `[:200]` slice
+
+### Security
+
+- `query_metric`: validate `label_filter` against `[a-zA-Z0-9_.='<>!()\[\]\s,]+` allowlist
+  before sending to SigNoz query API (LOW-01 — 2026-05-30/signoz-mcp-deploy-2026-05)
+- `observability.py`: log directory created with mode 0750; log file chmod'd to 0640 on
+  startup (NE-05/FW-07 — 2026-05-30/signoz-mcp-deploy-2026-05)
+
 ## [0.1.2] — 2026-05-27
 
 ### Security
