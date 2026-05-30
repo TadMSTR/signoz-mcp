@@ -27,8 +27,13 @@ def configure_logging() -> None:
     if log_file:
         log_dir = os.path.dirname(log_file)
         if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
+            os.makedirs(log_dir, mode=0o750, exist_ok=True)
+            os.chmod(log_dir, 0o750)  # fix pre-existing dir if umask was wrong
         handlers.append(logging.FileHandler(log_file))
+        try:
+            os.chmod(log_file, 0o640)  # tighten: FileHandler creates with process umask (0664)
+        except OSError:
+            pass
 
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
