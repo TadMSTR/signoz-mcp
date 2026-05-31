@@ -7,7 +7,7 @@ access to services, traces, logs, metrics, and alert rules via the SigNoz HTTP A
 
 | Tool | Description |
 |------|-------------|
-| `list_services` | All services with RED metrics |
+| `list_services` | All registered service names — returns `list[str]` (SigNoz v0.118+ changed the API; RED metrics are no longer returned from this endpoint) |
 | `count_errors` | Error span count grouped by service over a time range |
 | `search_traces` | Filter traces by service, error state, minimum duration |
 | `tail_logs` | Recent logs for a service filtered by severity |
