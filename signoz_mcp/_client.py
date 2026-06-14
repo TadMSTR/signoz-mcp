@@ -10,11 +10,12 @@ import structlog
 
 _log = structlog.get_logger("signoz-mcp")
 
-_ALLOWED_QUERY_VERSIONS = frozenset({"v3", "v5"})
+# v3 was removed in SigNoz v0.118; only v5 is supported.
+_ALLOWED_QUERY_VERSIONS = frozenset({"v5"})
 
 SIGNOZ_URL = os.environ.get("SIGNOZ_URL", "http://localhost:8080").rstrip("/")
 SIGNOZ_API_KEY = os.environ.get("SIGNOZ_API_KEY", "")
-SIGNOZ_QUERY_VERSION = os.environ.get("SIGNOZ_QUERY_VERSION", "v3")
+SIGNOZ_QUERY_VERSION = os.environ.get("SIGNOZ_QUERY_VERSION", "v5")
 
 if SIGNOZ_QUERY_VERSION not in _ALLOWED_QUERY_VERSIONS:
     raise RuntimeError(
@@ -49,7 +50,6 @@ def _build_query_payload(
         "start": start_ms,
         "end": end_ms,
         "requestType": request_type,
-        "variables": {},
         "compositeQuery": {
             "queries": [
                 {
