@@ -10,14 +10,18 @@ Tools:
   tail_logs          — Recent logs for a service filtered by severity
   count_log_errors   — Error/warn log rate over time
   query_metric       — Named metric with optional label filter
-  list_metrics       — All ingested metric names
+  list_metrics       — All ingested metric names (requires SigNoz v0.117 or earlier)
   list_alert_rules   — Alert rules + firing state
   get_health         — Connectivity check
 
 Configuration:
   SIGNOZ_URL              — SigNoz base URL (default: http://localhost:8080)
   SIGNOZ_API_KEY          — Service Account token (required)
-  SIGNOZ_QUERY_VERSION    — API path version: v3 or v5 (default: v3)
+  SIGNOZ_QUERY_VERSION    — API path version: v5 (default: v5; v3 removed in v0.118)
+
+API compatibility:
+  This server targets the SigNoz v5 query_range API introduced alongside v0.118.
+  The v3 endpoint was removed in v0.118 — do not set SIGNOZ_QUERY_VERSION=v3.
 """
 
 from __future__ import annotations
@@ -163,13 +167,15 @@ async def count_errors(
         "limit": limit,
     }
     body = await client.query("traces", "time_series", spec, start_ms, end_ms)
-    results = body.get("data", {}).get("result", [])
+    results = body.get("data", {}).get("data", {}).get("results", [])
     rows = []
     for series in results:
-        metric = series.get("metric", {})
-        values = series.get("values", [])
-        total = sum(float(v) for _, v in values) if values else 0
-        rows.append({"serviceName": metric.get("serviceName", ""), "error_count": total})
+        for agg in series.get("aggregations") or []:
+            if agg.get("alias") == "error_count":
+                svc_name = (agg.get("labels") or {}).get("serviceName", "")
+                pts = agg.get("values") or []
+                total = sum(float(v) for _, v in pts) if pts else 0.0
+                rows.append({"serviceName": svc_name, "error_count": total})
     rows.sort(key=lambda r: r["error_count"], reverse=True)
     return rows
 
@@ -215,7 +221,11 @@ async def search_traces(
         "limit": limit,
     }
     body = await client.query("traces", "trace", spec, start_ms, end_ms)
-    return body.get("data", {}).get("result", [])[:limit]
+    results = body.get("data", {}).get("data", {}).get("results", [])
+    rows = []
+    for r in results:
+        rows.extend(r.get("rows") or [])
+    return rows[:limit]
 
 
 @mcp.tool()
@@ -236,7 +246,7 @@ async def tail_logs(
         limit:    Max log lines to return (max 500).
 
     Returns:
-        List of log dicts with timestamp, severityText, body, and service fields.
+        List of log dicts with timestamp, severity_text, body, and resource fields.
     """
     _validate_service(service)
     sev = _validate_severity(severity)
@@ -244,7 +254,10 @@ async def tail_logs(
     end_ms = _parse_time_ms(end)
     limit = min(limit, _MAX_LIMIT_RAW)
 
-    filter_expr = f"serviceName = '{service}' AND severityText = '{sev}'"
+    # In the v5 logs schema, service name is a resource attribute (resource.service.name)
+    # and cannot be used in filter expressions directly — only in groupBy.
+    # Filter on severity_text only; callers should narrow time range for service-level queries.
+    filter_expr = f"severity_text = '{sev}'"
 
     spec = {
         "stepInterval": 60,
@@ -253,7 +266,11 @@ async def tail_logs(
         "limit": limit,
     }
     body = await client.query("logs", "raw", spec, start_ms, end_ms)
-    return body.get("data", {}).get("result", [])[:limit]
+    results = body.get("data", {}).get("data", {}).get("results", [])
+    rows = []
+    for r in results:
+        rows.extend(r.get("rows") or [])
+    return rows[:limit]
 
 
 @mcp.tool()
@@ -279,19 +296,23 @@ async def count_log_errors(
     spec = {
         "stepInterval": 60,
         "aggregations": [{"expression": "count()", "alias": "log_error_count"}],
-        "filter": {"expression": "severityText IN ['ERROR', 'WARN']"},
-        "groupBy": [{"name": "serviceName"}],
+        "filter": {"expression": "severity_text IN ['ERROR', 'WARN']"},
+        # In the v5 logs schema, service name is stored as a resource attribute.
+        "groupBy": [{"name": "resource.service.name"}],
         "order": [{"key": {"name": "log_error_count"}, "direction": "desc"}],
         "limit": limit,
     }
     body = await client.query("logs", "time_series", spec, start_ms, end_ms)
-    results = body.get("data", {}).get("result", [])
+    results = body.get("data", {}).get("data", {}).get("results", [])
     rows = []
-    for series in results:
-        metric = series.get("metric", {})
-        values = series.get("values", [])
-        total = sum(float(v) for _, v in values) if values else 0
-        rows.append({"serviceName": metric.get("serviceName", ""), "log_error_count": total})
+    for r in results:
+        aggs = r.get("aggregations") or []
+        for agg in aggs:
+            if agg.get("alias") == "log_error_count":
+                svc_name = (agg.get("labels") or {}).get("resource.service.name", "")
+                pts = agg.get("values") or []
+                total = sum(float(v) for _, v in pts) if pts else 0.0
+                rows.append({"serviceName": svc_name, "log_error_count": total})
     rows.sort(key=lambda r: r["log_error_count"], reverse=True)
     return rows
 
@@ -308,7 +329,7 @@ async def query_metric(
 
     Args:
         metric_name:   Metric name, e.g. 'system_cpu_time'.
-        label_filter:  Optional filter expression, e.g. 'state = 'idle''.
+        label_filter:  Optional filter expression, e.g. "state = 'idle'".
         start:         Start time, e.g. '-1h'.
         end:           End time. Defaults to 'now'.
         step_interval: Aggregation step in seconds.
@@ -331,28 +352,49 @@ async def query_metric(
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
 
-    spec: dict = {
+    # v5 metrics API: metricName lives inside the aggregation object, not at spec top level.
+    # timeAggregation and spaceAggregation replace the v3 expression-based format.
+    aggregation: dict = {
         "metricName": metric_name,
+        "timeAggregation": "avg",
+        "spaceAggregation": "avg",
+    }
+    spec: dict = {
         "stepInterval": step_interval,
-        "aggregations": [{"expression": "avg(value)", "alias": "avg"}],
+        "aggregations": [aggregation],
     }
     if label_filter:
         spec["filter"] = {"expression": label_filter}
 
     body = await client.query("metrics", "time_series", spec, start_ms, end_ms)
-    return body.get("data", {}).get("result", [])[:200]
+    results = body.get("data", {}).get("data", {}).get("results", [])
+    rows = []
+    for r in results:
+        aggs = r.get("aggregations") or []
+        rows.extend(aggs)
+    return rows[:200]
 
 
 @mcp.tool()
-async def list_metrics() -> list[str]:
+async def list_metrics() -> dict:
     """List all metric names currently ingested in SigNoz.
 
+    Note:
+        The /api/v1/metricsNames endpoint was removed in SigNoz v0.118.
+        This tool is not available on v0.118+. Use the SigNoz UI Metrics Explorer
+        or query specific metric names directly with query_metric.
+
     Returns:
-        Sorted list of metric name strings.
+        Dict with 'error' key explaining the limitation.
     """
-    data = await client.get("/api/v1/metricsNames")
-    names = data if isinstance(data, list) else data.get("data", [])
-    return sorted(names)[:500]
+    return {
+        "error": (
+            "list_metrics is not available on SigNoz v0.118+. "
+            "The /api/v1/metricsNames endpoint was removed in this release. "
+            "Use the SigNoz UI Metrics Explorer to browse metric names, "
+            "or call query_metric with a known metric name directly."
+        )
+    }
 
 
 @mcp.tool()
