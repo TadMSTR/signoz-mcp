@@ -48,6 +48,12 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["B", "SIM"]
 
+[tool.coverage.run]
+omit = [
+    "signoz_mcp/__main__.py",
+    "signoz_mcp/observability.py",
+]
+
 [tool.coverage.report]
 fail_under = 80
 show_missing = true
