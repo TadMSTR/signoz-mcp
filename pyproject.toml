@@ -10,11 +10,27 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 keywords = ["mcp", "signoz", "observability", "traces", "logs", "metrics", "fastmcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "fastmcp>=3.2.0,<4.0.0",
     "httpx>=0.27",
     "structlog>=24.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/TadMSTR/signoz-mcp"
+Repository = "https://github.com/TadMSTR/signoz-mcp"
+Issues = "https://github.com/TadMSTR/signoz-mcp/issues"
+Changelog = "https://github.com/TadMSTR/signoz-mcp/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 otel = [

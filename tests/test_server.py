@@ -88,11 +88,7 @@ def _v5_time_series(aggregations: list[dict]) -> dict:
         "status": "success",
         "data": {
             "type": "time_series",
-            "data": {
-                "results": [
-                    {"queryName": "A", "aggregations": aggregations}
-                ]
-            },
+            "data": {"results": [{"queryName": "A", "aggregations": aggregations}]},
         },
     }
 
@@ -103,11 +99,7 @@ def _v5_raw(rows: list[dict]) -> dict:
         "status": "success",
         "data": {
             "type": "raw",
-            "data": {
-                "results": [
-                    {"queryName": "A", "nextCursor": "", "rows": rows}
-                ]
-            },
+            "data": {"results": [{"queryName": "A", "nextCursor": "", "rows": rows}]},
         },
     }
 
@@ -118,11 +110,7 @@ def _v5_trace(rows: list[dict]) -> dict:
         "status": "success",
         "data": {
             "type": "trace",
-            "data": {
-                "results": [
-                    {"queryName": "A", "nextCursor": "", "rows": rows}
-                ]
-            },
+            "data": {"results": [{"queryName": "A", "nextCursor": "", "rows": rows}]},
         },
     }
 
@@ -151,18 +139,20 @@ async def test_count_errors_returns_sorted_rows():
     respx.post("http://localhost:8080/api/v5/query_range").mock(
         return_value=Response(
             200,
-            json=_v5_time_series([
-                {
-                    "alias": "error_count",
-                    "labels": {"serviceName": "frontend"},
-                    "values": [[1700000000000, "5"], [1700000060000, "3"]],
-                },
-                {
-                    "alias": "error_count",
-                    "labels": {"serviceName": "backend"},
-                    "values": [[1700000000000, "1"]],
-                },
-            ]),
+            json=_v5_time_series(
+                [
+                    {
+                        "alias": "error_count",
+                        "labels": {"serviceName": "frontend"},
+                        "values": [[1700000000000, "5"], [1700000060000, "3"]],
+                    },
+                    {
+                        "alias": "error_count",
+                        "labels": {"serviceName": "backend"},
+                        "values": [[1700000000000, "1"]],
+                    },
+                ]
+            ),
         )
     )
     from signoz_mcp.server import count_errors
@@ -342,13 +332,15 @@ async def test_count_log_errors_returns_sorted_rows():
     respx.post("http://localhost:8080/api/v5/query_range").mock(
         return_value=Response(
             200,
-            json=_v5_time_series([
-                {
-                    "alias": "log_error_count",
-                    "labels": {"resource.service.name": "svc-a"},
-                    "values": [[1700000000000, "10"]],
-                },
-            ]),
+            json=_v5_time_series(
+                [
+                    {
+                        "alias": "log_error_count",
+                        "labels": {"resource.service.name": "svc-a"},
+                        "values": [[1700000000000, "10"]],
+                    },
+                ]
+            ),
         )
     )
     from signoz_mcp.server import count_log_errors
@@ -390,13 +382,15 @@ async def test_query_metric_happy_path():
     respx.post("http://localhost:8080/api/v5/query_range").mock(
         return_value=Response(
             200,
-            json=_v5_time_series([
-                {
-                    "alias": "avg",
-                    "labels": {"state": "idle"},
-                    "values": [[1700000000000, "0.95"]],
-                }
-            ]),
+            json=_v5_time_series(
+                [
+                    {
+                        "alias": "avg",
+                        "labels": {"state": "idle"},
+                        "values": [[1700000000000, "0.95"]],
+                    }
+                ]
+            ),
         )
     )
     from signoz_mcp.server import query_metric
