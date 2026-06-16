@@ -19,7 +19,7 @@ module.exports = {
     env: {
       SIGNOZ_URL: "http://localhost:8080",
       SIGNOZ_API_KEY: process.env.SIGNOZ_API_KEY,
-      SIGNOZ_QUERY_VERSION: "v3",
+      SIGNOZ_QUERY_VERSION: "v5",
       FASTMCP_TRANSPORT: "streamable-http",
       FASTMCP_PORT: "8492",
       FASTMCP_HOST: "127.0.0.1",
