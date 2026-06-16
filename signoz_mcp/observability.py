@@ -4,6 +4,7 @@ Observability setup for signoz-mcp.
 Structured logging is always on. OTEL is opt-in via env var.
 """
 
+import contextlib
 import logging
 import os
 import sys
@@ -30,10 +31,8 @@ def configure_logging() -> None:
             os.makedirs(log_dir, mode=0o750, exist_ok=True)
             os.chmod(log_dir, 0o750)  # fix pre-existing dir if umask was wrong
         handlers.append(logging.FileHandler(log_file))
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(log_file, 0o640)  # tighten: FileHandler creates with process umask (0664)
-        except OSError:
-            pass
 
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
@@ -79,7 +78,9 @@ def get_tracer():
         return None
     try:
         from opentelemetry import trace  # type: ignore
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter  # type: ignore
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+            OTLPSpanExporter,  # type: ignore
+        )
         from opentelemetry.sdk.resources import Resource  # type: ignore
         from opentelemetry.sdk.trace import TracerProvider  # type: ignore
         from opentelemetry.sdk.trace.export import BatchSpanProcessor  # type: ignore
