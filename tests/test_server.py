@@ -12,7 +12,6 @@ import pytest
 import respx
 from httpx import Response
 
-
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 

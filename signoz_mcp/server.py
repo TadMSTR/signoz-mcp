@@ -338,7 +338,10 @@ async def query_metric(
         List of time-series dicts with metric labels and values array.
     """
     if not _METRIC_NAME_RE.match(metric_name):
-        raise ValueError(f"Invalid metric name {metric_name!r}: only alphanumeric, dot, underscore, colon, slash, dash allowed")
+        raise ValueError(
+            f"Invalid metric name {metric_name!r}: "
+            "only alphanumeric, dot, underscore, colon, slash, dash allowed"
+        )
     if label_filter and len(label_filter) > _MAX_LABEL_FILTER_LEN:
         raise ValueError(f"label_filter too long: max {_MAX_LABEL_FILTER_LEN} chars")
     # SECURITY[resolved]: Validate label_filter against allowlist regex before passing to
