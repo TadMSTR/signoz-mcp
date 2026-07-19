@@ -35,13 +35,19 @@ API compatibility:
 
 from __future__ import annotations
 
+import functools
+import inspect
 import re
 import time
+from collections.abc import Callable
+from typing import Any
 
 import structlog
 from fastmcp import FastMCP
 
 from signoz_mcp import _client as client
+from signoz_mcp import telemetry
+from signoz_mcp.hooks import run_after_hooks, run_before_hooks
 
 _log = structlog.get_logger("signoz-mcp")
 
@@ -116,6 +122,41 @@ mcp = FastMCP(
         "All tools are read-only — SigNoz write endpoints are never exposed."
     ),
 )
+
+# Optional telemetry (OTLP spans+metrics, InfluxDB3, NATS) — no-op unless env-configured.
+telemetry.init()
+
+
+def instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a tool coroutine with the pre/post hook chain and telemetry.
+
+    Around every tool call this: runs the registered *before* hooks (which may mutate the
+    kwargs), opens a telemetry span + records call/error/latency, runs the tool, then runs
+    the registered *after* hooks (which may transform the result). Hook exceptions
+    propagate — hooks are not fire-and-forget.
+
+    The wrapped callable keeps ``fn``'s signature (via ``__signature__``) so FastMCP still
+    derives the correct tool schema.
+    """
+    tool_name = fn.__name__
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        bound = sig.bind(*args, **kwargs)
+        call_kwargs = dict(bound.arguments)
+        call_kwargs = await run_before_hooks(tool_name, call_kwargs)
+        async with telemetry.record_tool_call(tool_name):
+            result = await fn(**call_kwargs)
+        return await run_after_hooks(tool_name, result)
+
+    wrapper.__signature__ = sig  # type: ignore[attr-defined]
+    return wrapper
+
+
+def tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Register ``fn`` as an instrumented MCP tool. Use as ``@tool`` (no parentheses)."""
+    return mcp.tool()(instrument(fn))
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
@@ -345,7 +386,7 @@ def _parse_aggregate(body: dict, request_type: str) -> list[dict]:
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 
-@mcp.tool()
+@tool
 async def list_services() -> list[str]:
     """List all service names registered in SigNoz.
 
@@ -356,7 +397,7 @@ async def list_services() -> list[str]:
     return data if isinstance(data, list) else []
 
 
-@mcp.tool()
+@tool
 async def search_traces(
     filter: str = "",
     service: str = "",
@@ -418,7 +459,7 @@ async def search_traces(
     return _extract_rows(body)[:limit]
 
 
-@mcp.tool()
+@tool
 async def aggregate_traces(
     aggregation: str,
     aggregate_on: str = "",
@@ -501,7 +542,7 @@ async def aggregate_traces(
     return _parse_aggregate(body, req_type)
 
 
-@mcp.tool()
+@tool
 async def get_trace_details(
     trace_id: str,
     start: str = "-6h",
@@ -536,7 +577,7 @@ async def get_trace_details(
     return _extract_rows(body)
 
 
-@mcp.tool()
+@tool
 async def tail_logs(
     service: str,
     severity: str = "ERROR",
@@ -575,7 +616,7 @@ async def tail_logs(
     return _extract_rows(body)[:limit]
 
 
-@mcp.tool()
+@tool
 async def search_logs(
     filter: str = "",
     service: str = "",
@@ -630,7 +671,7 @@ async def search_logs(
     return _extract_rows(body)[:limit]
 
 
-@mcp.tool()
+@tool
 async def aggregate_logs(
     aggregation: str,
     aggregate_on: str = "",
@@ -706,7 +747,7 @@ async def aggregate_logs(
     return _parse_aggregate(body, req_type)
 
 
-@mcp.tool()
+@tool
 async def query_metric(
     metric_name: str,
     label_filter: str = "",
@@ -759,7 +800,7 @@ async def query_metric(
     return rows[:200]
 
 
-@mcp.tool()
+@tool
 async def list_metrics(
     search_text: str = "",
     start: str = "-1h",
@@ -805,7 +846,7 @@ async def list_metrics(
     return metrics[:limit]
 
 
-@mcp.tool()
+@tool
 async def get_field_keys(
     signal: str,
     search_text: str = "",
@@ -847,7 +888,7 @@ async def get_field_keys(
     return data.get("data", {}) if isinstance(data, dict) else {}
 
 
-@mcp.tool()
+@tool
 async def get_field_values(
     signal: str,
     name: str,
@@ -889,7 +930,7 @@ async def get_field_values(
     return data.get("data", {}) if isinstance(data, dict) else {}
 
 
-@mcp.tool()
+@tool
 async def list_alert_rules() -> list[dict]:
     """List all alert rules and their current firing state.
 
@@ -901,7 +942,7 @@ async def list_alert_rules() -> list[dict]:
     return rules[:200]
 
 
-@mcp.tool()
+@tool
 async def get_health() -> dict:
     """Check SigNoz connectivity.
 
@@ -911,10 +952,31 @@ async def get_health() -> dict:
     return await client.get("/api/v1/health")
 
 
+# All registered tool names — used to wire the audit-log before-hook across the surface.
+_TOOL_NAMES = (
+    "list_services",
+    "search_traces",
+    "aggregate_traces",
+    "get_trace_details",
+    "tail_logs",
+    "search_logs",
+    "aggregate_logs",
+    "query_metric",
+    "list_metrics",
+    "get_field_keys",
+    "get_field_values",
+    "list_alert_rules",
+    "get_health",
+)
+
+
 def main() -> None:
+    from .contrib.audit_log import register_audit_log
     from .observability import configure_logging
 
     configure_logging()
+    # Audit-log every query (who/what/args-hash) via the existing structlog logger.
+    register_audit_log(_TOOL_NAMES)
     mcp.run()
 
 

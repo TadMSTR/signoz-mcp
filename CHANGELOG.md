@@ -19,6 +19,26 @@
 
 ### Added
 
+- **Telemetry + pre/post-hook layer** (forge MCP standard, ported from vikunja-mcp
+  v0.2.0). All off by default; the base install gains zero new required deps.
+  - `signoz_mcp/telemetry.py` — per-tool-call OTLP spans + metrics
+    (`signoz_mcp.tool.calls`/`.errors`/`.latency`), plus best-effort fire-and-forget
+    InfluxDB 3 and NATS sinks. Every backend import is lazy/guarded. New env vars
+    (all optional): `SIGNOZ_MCP_INFLUXDB3_URL`/`_TOKEN`/`_DATABASE`,
+    `SIGNOZ_MCP_NATS_URL`/`_SUBJECT`, and the existing `OTEL_EXPORTER_OTLP_ENDPOINT`
+    (now actually wired to metrics + spans). The `SIGNOZ_MCP_` prefix keeps this
+    server's telemetry config separate from the upstream `SIGNOZ_*` connection vars.
+  - `signoz_mcp/hooks.py` — `register_before`/`register_after` extension-hook
+    registry; before-hooks can mutate/abort a call, after-hooks can transform results.
+  - `server.instrument`/`server.tool` wrap every tool as
+    `run_before_hooks → span/metric → tool body → run_after_hooks`, preserving each
+    tool's signature (`wrapper.__signature__`) so FastMCP's schema introspection is
+    unchanged.
+  - `signoz_mcp/contrib/audit_log.py` — a read-only audit-log before-hook
+    (who/what/args-hash, never raw arg values) registered across all tools at startup.
+  - New `telemetry` optional-dependency extra (replaces the narrower `otel` extra):
+    `opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-grpc`, `influxdb3-python`,
+    `nats-py`.
 - `aggregate_traces(...)` / `aggregate_logs(...)` — generic aggregation tools
   (count/count_distinct/avg/sum/min/max/p50–p99/rate) with `group_by`, free-form
   `filter` + shortcut params, and `request_type` `scalar` (default) or
@@ -67,6 +87,11 @@
   internal URL.
 - `search_traces` / `tail_logs`: rows are now unwrapped from the v5
   `{"data": {...}}` per-row envelope before being returned.
+
+### Removed
+
+- `observability.py::get_tracer()` — dead code (was never called). OTEL tracing
+  now lives in `telemetry.py`, wired into every tool call.
 
 ### Added
 

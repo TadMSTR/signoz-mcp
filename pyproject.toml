@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signoz-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "FastMCP server for SigNoz observability queries — read-only access to services, traces, logs, metrics, and alerts"
 readme = "README.md"
 license = "MIT"
@@ -32,9 +32,14 @@ Issues = "https://github.com/TadMSTR/signoz-mcp/issues"
 Changelog = "https://github.com/TadMSTR/signoz-mcp/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-otel = [
+# All telemetry backends are optional and off by default (see signoz_mcp/telemetry.py).
+# The base install carries none of these; enabling a backend needs this extra.
+telemetry = [
     "opentelemetry-sdk>=1.20",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20",
+    # forge runs influxdb:3-core — the v3 write API (imports as influxdb_client_3).
+    "influxdb3-python>=0.9",
+    "nats-py>=2.6",
 ]
 dev = [
     "pytest>=8.0",

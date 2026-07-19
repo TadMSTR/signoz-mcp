@@ -62,34 +62,5 @@ def configure_logging() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# OTEL tracing (opt-in)
-# ---------------------------------------------------------------------------
-
-_tracer = None
-
-
-def get_tracer():
-    global _tracer
-    if _tracer is not None:
-        return _tracer
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-    if not endpoint:
-        return None
-    try:
-        from opentelemetry import trace  # type: ignore
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
-            OTLPSpanExporter,  # type: ignore
-        )
-        from opentelemetry.sdk.resources import Resource  # type: ignore
-        from opentelemetry.sdk.trace import TracerProvider  # type: ignore
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor  # type: ignore
-
-        resource = Resource.create({"service.name": "signoz-mcp"})
-        provider = TracerProvider(resource=resource)
-        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
-        trace.set_tracer_provider(provider)
-        _tracer = trace.get_tracer("signoz-mcp")
-    except Exception:
-        structlog.get_logger().warning("otel_init_failed", exc_info=True)
-    return _tracer
+# OTEL tracing + metrics now live in signoz_mcp/telemetry.py (opt-in via
+# OTEL_EXPORTER_OTLP_ENDPOINT, wired into every tool call by server.instrument).
