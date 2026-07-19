@@ -1,11 +1,18 @@
 """Tests for signoz_mcp/server.py and signoz_mcp/_client.py.
 
-API compatibility note: signoz-mcp targets the SigNoz v5 query_range API.
-The v3 endpoint was removed in SigNoz v0.118.
+API compatibility note: signoz-mcp targets the SigNoz v5 query_range API used by
+v0.118. The mock helpers below reproduce the real response envelopes:
+  - time_series: data.data.results[].aggregations[].series[] with labels as a
+    list of {"key": {"name": ...}, "value": ...} and values as
+    {"timestamp": ..., "value": ...} points (backend-assigned alias "__result_0").
+  - scalar: data.data.results[].columns + .data (a column-aligned table).
+  - raw/trace: data.data.results[].rows[] where each row is {"data": {...}}.
+So the tests validate against reality, not an assumed schema.
 """
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -79,11 +86,61 @@ def test_validate_service_rejects_injection():
         _validate_service("svc<script>")
 
 
-# ── Helper: v5 time_series response ──────────────────────────────────────────
+def test_validate_signal_accepts_and_rejects():
+    from signoz_mcp.server import _validate_signal
+
+    assert _validate_signal("Traces") == "traces"
+    with pytest.raises(ValueError):
+        _validate_signal("bogus")
+
+
+def test_validate_filter_expr_allows_dashes_and_paths():
+    """Real service names have dashes; log body filters have slashes — both allowed."""
+    from signoz_mcp.server import _validate_filter_expr
+
+    assert _validate_filter_expr("service.name = 'scoped-mcp-developer'")
+    assert _validate_filter_expr("body CONTAINS '/api/v5'")
+    assert _validate_filter_expr("severity_text IN ['ERROR', 'WARN']")
+
+
+def test_validate_filter_expr_rejects_dangerous_chars():
+    from signoz_mcp.server import _validate_filter_expr
+
+    with pytest.raises(ValueError):
+        _validate_filter_expr("a = 1; DROP TABLE")  # semicolon
+    with pytest.raises(ValueError):
+        _validate_filter_expr("a = `whoami`")  # backtick
+    with pytest.raises(ValueError):
+        _validate_filter_expr("x" * 1001)  # too long
+
+
+def test_build_agg_expression():
+    from signoz_mcp.server import _build_agg_expression
+
+    assert _build_agg_expression("count", "") == "count()"
+    assert _build_agg_expression("rate", "") == "rate()"
+    assert _build_agg_expression("p99", "duration_nano") == "p99(duration_nano)"
+    with pytest.raises(ValueError):
+        _build_agg_expression("bogus", "x")
+    with pytest.raises(ValueError):
+        _build_agg_expression("p99", "")  # requires aggregate_on
+
+
+# ── Helpers: real v5 query_range response shapes ─────────────────────────────
+
+
+def _v5_series(labels: dict, points: list) -> dict:
+    return {
+        "labels": [{"key": {"name": k}, "value": v} for k, v in labels.items()],
+        "values": [{"timestamp": ts, "value": val} for ts, val in points],
+    }
+
+
+def _v5_agg(series: list[dict], alias: str = "__result_0") -> dict:
+    return {"index": 0, "alias": alias, "meta": {}, "series": series}
 
 
 def _v5_time_series(aggregations: list[dict]) -> dict:
-    """Build a minimal v5 query_range time_series response."""
     return {
         "status": "success",
         "data": {
@@ -93,24 +150,44 @@ def _v5_time_series(aggregations: list[dict]) -> dict:
     }
 
 
+def _v5_scalar(columns: list[str], rows: list[list]) -> dict:
+    return {
+        "status": "success",
+        "data": {
+            "type": "scalar",
+            "data": {
+                "results": [
+                    {"queryName": "A", "columns": [{"name": c} for c in columns], "data": rows}
+                ]
+            },
+        },
+    }
+
+
 def _v5_raw(rows: list[dict]) -> dict:
-    """Build a minimal v5 query_range raw response."""
     return {
         "status": "success",
         "data": {
             "type": "raw",
-            "data": {"results": [{"queryName": "A", "nextCursor": "", "rows": rows}]},
+            "data": {
+                "results": [
+                    {"queryName": "A", "nextCursor": "", "rows": [{"data": r} for r in rows]}
+                ]
+            },
         },
     }
 
 
 def _v5_trace(rows: list[dict]) -> dict:
-    """Build a minimal v5 query_range trace response."""
     return {
         "status": "success",
         "data": {
             "type": "trace",
-            "data": {"results": [{"queryName": "A", "nextCursor": "", "rows": rows}]},
+            "data": {
+                "results": [
+                    {"queryName": "A", "nextCursor": "", "rows": [{"data": r} for r in rows]}
+                ]
+            },
         },
     }
 
@@ -130,84 +207,13 @@ async def test_list_services_returns_list():
     assert result == ["frontend", "backend"]
 
 
-# ── count_errors ──────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_count_errors_returns_sorted_rows():
-    respx.post("http://localhost:8080/api/v5/query_range").mock(
-        return_value=Response(
-            200,
-            json=_v5_time_series(
-                [
-                    {
-                        "alias": "error_count",
-                        "labels": {"serviceName": "frontend"},
-                        "values": [[1700000000000, "5"], [1700000060000, "3"]],
-                    },
-                    {
-                        "alias": "error_count",
-                        "labels": {"serviceName": "backend"},
-                        "values": [[1700000000000, "1"]],
-                    },
-                ]
-            ),
-        )
-    )
-    from signoz_mcp.server import count_errors
-
-    rows = await count_errors(start="-1h")
-    assert rows[0]["serviceName"] == "frontend"
-    assert rows[0]["error_count"] == 8.0
-    assert rows[1]["serviceName"] == "backend"
-    assert rows[1]["error_count"] == 1.0
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_count_errors_limit_capped():
-    captured = []
-
-    def capture(request):
-        captured.append(request.content)
-        return Response(200, json=_v5_time_series([]))
-
-    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
-    from signoz_mcp.server import count_errors
-
-    await count_errors(limit=99999)
-    import json
-
-    payload = json.loads(captured[0])
-    spec = payload["compositeQuery"]["queries"][0]["spec"]
-    assert spec["limit"] <= 10000
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_count_errors_uses_v5_endpoint():
-    captured = []
-
-    def capture(request):
-        captured.append(request)
-        return Response(200, json=_v5_time_series([]))
-
-    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
-    from signoz_mcp.server import count_errors
-
-    await count_errors()
-    assert captured, "v5 query_range was not called"
-    assert "/api/v5/query_range" in str(captured[0].url)
-
-
 # ── search_traces ─────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_search_traces_happy_path():
-    trace_rows = [{"traceID": "abc123", "serviceName": "frontend", "hasError": True}]
+    trace_rows = [{"trace_id": "abc123", "service.name": "frontend", "span_count": 3}]
     respx.post("http://localhost:8080/api/v5/query_range").mock(
         return_value=Response(200, json=_v5_trace(trace_rows))
     )
@@ -215,7 +221,31 @@ async def test_search_traces_happy_path():
 
     result = await search_traces(service="frontend", has_error=True)
     assert len(result) == 1
-    assert result[0]["traceID"] == "abc123"
+    assert result[0]["trace_id"] == "abc123"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_search_traces_combines_filter_and_shortcuts():
+    captured = []
+
+    def capture(request):
+        captured.append(request.content)
+        return Response(200, json=_v5_trace([]))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import search_traces
+
+    await search_traces(
+        filter="http.status_code = 500", service="frontend", has_error=True, min_duration_ms=5
+    )
+    spec = json.loads(captured[0])["compositeQuery"]["queries"][0]["spec"]
+    expr = spec["filter"]["expression"]
+    assert "http.status_code = 500" in expr
+    assert "service.name = 'frontend'" in expr
+    assert "has_error = true" in expr
+    assert "duration_nano >= 5000000" in expr
+    assert " AND " in expr
 
 
 @pytest.mark.asyncio
@@ -227,8 +257,42 @@ async def test_search_traces_rejects_invalid_service():
 
 
 @pytest.mark.asyncio
+async def test_search_traces_rejects_bad_filter():
+    from signoz_mcp.server import search_traces
+
+    with pytest.raises(ValueError):
+        await search_traces(filter="a = 1; DROP TABLE")
+
+
+@pytest.mark.asyncio
+async def test_search_traces_rejects_operation_with_quotes():
+    """operation must not be able to break out of its 'name = <op>' string literal."""
+    from signoz_mcp.server import search_traces
+
+    with pytest.raises(ValueError):
+        await search_traces(operation="x' OR has_error='true")
+
+
+@pytest.mark.asyncio
 @respx.mock
-async def test_search_traces_limit_capped():
+async def test_search_traces_accepts_realistic_operation():
+    captured = []
+
+    def capture(request):
+        captured.append(request.content)
+        return Response(200, json=_v5_trace([]))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import search_traces
+
+    await search_traces(operation="tools/call system-ops_run_command")
+    expr = json.loads(captured[0])["compositeQuery"]["queries"][0]["spec"]["filter"]["expression"]
+    assert "name = 'tools/call system-ops_run_command'" in expr
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_search_traces_limit_capped_and_trace_request_type():
     captured = []
 
     def capture(request):
@@ -239,30 +303,130 @@ async def test_search_traces_limit_capped():
     from signoz_mcp.server import search_traces
 
     await search_traces(service="svc", limit=9999)
-    import json
-
     payload = json.loads(captured[0])
-    spec = payload["compositeQuery"]["queries"][0]["spec"]
-    assert spec["limit"] <= 500
+    assert payload["requestType"] == "trace"
+    assert payload["compositeQuery"]["queries"][0]["spec"]["limit"] <= 500
+
+
+# ── aggregate_traces ──────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_search_traces_uses_trace_request_type():
+async def test_aggregate_traces_scalar_parses_table():
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(
+            200,
+            json=_v5_scalar(["service.name", "__result_0"], [["svc-a", 1835], ["svc-b", 932]]),
+        )
+    )
+    from signoz_mcp.server import aggregate_traces
+
+    rows = await aggregate_traces(aggregation="count", group_by="service.name")
+    assert rows[0] == {"service.name": "svc-a", "__result_0": 1835}
+    assert rows[1]["service.name"] == "svc-b"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_aggregate_traces_builds_expression_and_groupby():
     captured = []
 
     def capture(request):
         captured.append(request.content)
-        return Response(200, json=_v5_trace([]))
+        return Response(200, json=_v5_scalar([], []))
 
     respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
-    from signoz_mcp.server import search_traces
+    from signoz_mcp.server import aggregate_traces
 
-    await search_traces(service="svc")
-    import json
-
+    await aggregate_traces(
+        aggregation="p99", aggregate_on="duration_nano", group_by="service.name,name"
+    )
     payload = json.loads(captured[0])
-    assert payload["requestType"] == "trace"
+    spec = payload["compositeQuery"]["queries"][0]["spec"]
+    assert payload["requestType"] == "scalar"
+    assert spec["aggregations"][0]["expression"] == "p99(duration_nano)"
+    assert [g["name"] for g in spec["groupBy"]] == ["service.name", "name"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_aggregate_traces_time_series_shape():
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(
+            200,
+            json=_v5_time_series(
+                [_v5_agg([_v5_series({"service.name": "svc-a"}, [(1700000000000, 3)])])]
+            ),
+        )
+    )
+    from signoz_mcp.server import aggregate_traces
+
+    rows = await aggregate_traces(
+        aggregation="count", group_by="service.name", request_type="time_series"
+    )
+    assert rows[0]["labels"]["service.name"] == "svc-a"
+    assert rows[0]["values"][0]["value"] == 3
+
+
+@pytest.mark.asyncio
+async def test_aggregate_traces_rejects_bad_inputs():
+    from signoz_mcp.server import aggregate_traces
+
+    with pytest.raises(ValueError):
+        await aggregate_traces(aggregation="bogus")
+    with pytest.raises(ValueError):
+        await aggregate_traces(aggregation="p99")  # missing aggregate_on
+    with pytest.raises(ValueError):
+        await aggregate_traces(aggregation="count", request_type="raw")  # bad request_type
+
+
+# ── get_trace_details ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_trace_details_returns_spans():
+    captured = []
+
+    def capture(request):
+        captured.append(request.content)
+        return Response(
+            200, json=_v5_raw([{"span_id": "s1", "trace_id": "abcdef"}, {"span_id": "s2"}])
+        )
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import get_trace_details
+
+    rows = await get_trace_details(trace_id="abcdef123456")
+    assert len(rows) == 2
+    assert rows[0]["span_id"] == "s1"
+    # include_spans=True must use the 'raw' request type (individual spans)
+    assert json.loads(captured[0])["requestType"] == "raw"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_trace_details_summary_uses_trace_type():
+    captured = []
+
+    def capture(request):
+        captured.append(request.content)
+        return Response(200, json=_v5_trace([{"trace_id": "abcdef", "span_count": 5}]))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import get_trace_details
+
+    await get_trace_details(trace_id="abcdef", include_spans=False)
+    assert json.loads(captured[0])["requestType"] == "trace"
+
+
+@pytest.mark.asyncio
+async def test_get_trace_details_rejects_invalid_id():
+    from signoz_mcp.server import get_trace_details
+
+    with pytest.raises(ValueError):
+        await get_trace_details(trace_id="not-hex!!")
 
 
 # ── tail_logs ─────────────────────────────────────────────────────────────────
@@ -304,7 +468,6 @@ async def test_tail_logs_rejects_invalid_severity():
 @pytest.mark.asyncio
 @respx.mock
 async def test_tail_logs_uses_severity_text_filter():
-    """tail_logs must filter on severity_text (v5 logs field name)."""
     captured = []
 
     def capture(request):
@@ -315,62 +478,58 @@ async def test_tail_logs_uses_severity_text_filter():
     from signoz_mcp.server import tail_logs
 
     await tail_logs(service="backend", severity="warn")
-    import json
-
-    payload = json.loads(captured[0])
-    spec = payload["compositeQuery"]["queries"][0]["spec"]
+    spec = json.loads(captured[0])["compositeQuery"]["queries"][0]["spec"]
     assert "severity_text" in spec["filter"]["expression"]
     assert "WARN" in spec["filter"]["expression"]
 
 
-# ── count_log_errors ──────────────────────────────────────────────────────────
+# ── search_logs ───────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_count_log_errors_returns_sorted_rows():
-    respx.post("http://localhost:8080/api/v5/query_range").mock(
-        return_value=Response(
-            200,
-            json=_v5_time_series(
-                [
-                    {
-                        "alias": "log_error_count",
-                        "labels": {"resource.service.name": "svc-a"},
-                        "values": [[1700000000000, "10"]],
-                    },
-                ]
-            ),
-        )
-    )
-    from signoz_mcp.server import count_log_errors
-
-    rows = await count_log_errors()
-    assert rows[0]["serviceName"] == "svc-a"
-    assert rows[0]["log_error_count"] == 10.0
-
-
-@pytest.mark.asyncio
-@respx.mock
-async def test_count_log_errors_uses_resource_service_name_groupby():
-    """groupBy must use resource.service.name (v5 logs field, not v3 serviceName)."""
+async def test_search_logs_builds_filter():
     captured = []
 
     def capture(request):
         captured.append(request.content)
-        return Response(200, json=_v5_time_series([]))
+        return Response(200, json=_v5_raw([{"body": "boom"}]))
 
     respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
-    from signoz_mcp.server import count_log_errors
+    from signoz_mcp.server import search_logs
 
-    await count_log_errors()
-    import json
+    result = await search_logs(severity="error", search_text="boom")
+    assert result[0]["body"] == "boom"
+    expr = json.loads(captured[0])["compositeQuery"]["queries"][0]["spec"]["filter"]["expression"]
+    assert "severity_text = 'ERROR'" in expr
+    assert "body CONTAINS 'boom'" in expr
 
-    payload = json.loads(captured[0])
-    spec = payload["compositeQuery"]["queries"][0]["spec"]
-    group_names = [g["name"] for g in spec.get("groupBy", [])]
-    assert "resource.service.name" in group_names
-    assert "serviceName" not in group_names
+
+@pytest.mark.asyncio
+async def test_search_logs_rejects_bad_severity():
+    from signoz_mcp.server import search_logs
+
+    with pytest.raises(ValueError):
+        await search_logs(severity="NOPE")
+
+
+# ── aggregate_logs ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_aggregate_logs_scalar():
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(
+            200, json=_v5_scalar(["severity_text", "__result_0"], [["ERROR", 12]])
+        )
+    )
+    from signoz_mcp.server import aggregate_logs
+
+    rows = await aggregate_logs(
+        aggregation="count", group_by="severity_text", filter="severity_text IN ['ERROR', 'WARN']"
+    )
+    assert rows[0] == {"severity_text": "ERROR", "__result_0": 12}
 
 
 # ── query_metric ──────────────────────────────────────────────────────────────
@@ -383,13 +542,7 @@ async def test_query_metric_happy_path():
         return_value=Response(
             200,
             json=_v5_time_series(
-                [
-                    {
-                        "alias": "avg",
-                        "labels": {"state": "idle"},
-                        "values": [[1700000000000, "0.95"]],
-                    }
-                ]
+                [_v5_agg([_v5_series({"state": "idle"}, [(1700000000000, 0.95)])])]
             ),
         )
     )
@@ -398,12 +551,12 @@ async def test_query_metric_happy_path():
     result = await query_metric(metric_name="system_cpu_time")
     assert len(result) == 1
     assert result[0]["labels"]["state"] == "idle"
+    assert result[0]["values"][0]["value"] == 0.95
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_query_metric_uses_v5_aggregation_format():
-    """v5 metrics: metricName must be inside the aggregation object."""
     captured = []
 
     def capture(request):
@@ -414,13 +567,8 @@ async def test_query_metric_uses_v5_aggregation_format():
     from signoz_mcp.server import query_metric
 
     await query_metric(metric_name="system_cpu_time")
-    import json
-
-    payload = json.loads(captured[0])
-    spec = payload["compositeQuery"]["queries"][0]["spec"]
-    # metricName must NOT be at the top level of spec
+    spec = json.loads(captured[0])["compositeQuery"]["queries"][0]["spec"]
     assert "metricName" not in spec, "metricName must not be at spec top level in v5"
-    # metricName must be inside the aggregation
     agg = spec["aggregations"][0]
     assert agg["metricName"] == "system_cpu_time"
     assert "timeAggregation" in agg
@@ -440,7 +588,7 @@ async def test_query_metric_rejects_long_label_filter():
     from signoz_mcp.server import query_metric
 
     with pytest.raises(ValueError):
-        await query_metric(metric_name="my_metric", label_filter="x" * 501)
+        await query_metric(metric_name="my_metric", label_filter="x" * 1001)
 
 
 @pytest.mark.asyncio
@@ -451,18 +599,164 @@ async def test_query_metric_rejects_disallowed_label_filter_chars():
         await query_metric(metric_name="my_metric", label_filter="state = 'idle'; --inject")
 
 
+@pytest.mark.asyncio
+@respx.mock
+async def test_query_metric_missing_metric_raises_clean_error():
+    """A 404 'could not find the metric' surfaces as a clean ValueError, not a raw httpx error."""
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(
+            404,
+            json={
+                "status": "error",
+                "error": {"code": "not_found", "message": "could not find the metric foo"},
+            },
+        )
+    )
+    from signoz_mcp.server import query_metric
+
+    with pytest.raises(ValueError) as exc_info:
+        await query_metric(metric_name="foo")
+    assert "could not find the metric foo" in str(exc_info.value)
+    assert "test-api-key" not in str(exc_info.value)
+
+
 # ── list_metrics ──────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_list_metrics_returns_unavailable_message():
-    """list_metrics must explain that the endpoint was removed in v0.118+."""
+@respx.mock
+async def test_list_metrics_returns_metric_list():
+    respx.get("http://localhost:8080/api/v2/metrics").mock(
+        return_value=Response(
+            200,
+            json={
+                "data": {
+                    "metrics": [
+                        {
+                            "metricName": "system_cpu_time",
+                            "type": "sum",
+                            "temporality": "cumulative",
+                            "isMonotonic": True,
+                        }
+                    ]
+                }
+            },
+        )
+    )
     from signoz_mcp.server import list_metrics
 
-    result = await list_metrics()
-    assert isinstance(result, dict)
-    assert "error" in result
-    assert "v0.118" in result["error"]
+    result = await list_metrics(search_text="cpu")
+    assert isinstance(result, list)
+    assert result[0]["metricName"] == "system_cpu_time"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_metrics_uses_v2_endpoint_and_params():
+    captured = []
+
+    def capture(request):
+        captured.append(request)
+        return Response(200, json={"data": {"metrics": []}})
+
+    respx.get("http://localhost:8080/api/v2/metrics").mock(side_effect=capture)
+    from signoz_mcp.server import list_metrics
+
+    await list_metrics(search_text="mem", limit=5)
+    assert captured, "v2 metrics endpoint was not called"
+    url = str(captured[0].url)
+    assert "/api/v2/metrics" in url
+    assert "searchText=mem" in url
+
+
+@pytest.mark.asyncio
+async def test_list_metrics_rejects_bad_search_text():
+    from signoz_mcp.server import list_metrics
+
+    with pytest.raises(ValueError):
+        await list_metrics(search_text="cpu'; DROP--")
+
+
+# ── get_field_keys / get_field_values ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_field_keys_happy_path():
+    respx.get("http://localhost:8080/api/v1/fields/keys").mock(
+        return_value=Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"keys": {"service.name": [{"name": "service.name"}]}},
+            },
+        )
+    )
+    from signoz_mcp.server import get_field_keys
+
+    result = await get_field_keys(signal="traces", search_text="service")
+    assert "keys" in result
+    assert "service.name" in result["keys"]
+
+
+@pytest.mark.asyncio
+async def test_get_field_keys_rejects_bad_signal():
+    from signoz_mcp.server import get_field_keys
+
+    with pytest.raises(ValueError):
+        await get_field_keys(signal="bogus")
+
+
+@pytest.mark.asyncio
+async def test_get_field_keys_rejects_bad_field_context_and_type():
+    from signoz_mcp.server import get_field_keys
+
+    with pytest.raises(ValueError):
+        await get_field_keys(signal="traces", field_context="bogus")
+    with pytest.raises(ValueError):
+        await get_field_keys(signal="traces", field_data_type="notatype")
+
+
+@pytest.mark.asyncio
+async def test_get_field_values_rejects_bad_field_context():
+    from signoz_mcp.server import get_field_values
+
+    with pytest.raises(ValueError):
+        await get_field_values(signal="traces", name="service.name", field_context="bogus")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_field_values_happy_path():
+    respx.get("http://localhost:8080/api/v1/fields/values").mock(
+        return_value=Response(
+            200,
+            json={
+                "status": "success",
+                "data": {"values": {"stringValues": ["frontend", "backend"]}, "complete": True},
+            },
+        )
+    )
+    from signoz_mcp.server import get_field_values
+
+    result = await get_field_values(signal="traces", name="service.name")
+    assert result["values"]["stringValues"] == ["frontend", "backend"]
+
+
+@pytest.mark.asyncio
+async def test_get_field_values_requires_name():
+    from signoz_mcp.server import get_field_values
+
+    with pytest.raises(ValueError):
+        await get_field_values(signal="traces", name="")
+
+
+@pytest.mark.asyncio
+async def test_get_field_values_rejects_injection_name():
+    from signoz_mcp.server import get_field_values
+
+    with pytest.raises(ValueError):
+        await get_field_values(signal="traces", name="svc' OR 1=1")
 
 
 # ── list_alert_rules ──────────────────────────────────────────────────────────
@@ -499,7 +793,7 @@ async def test_get_health_returns_status():
     assert result["status"] == "ok"
 
 
-# ── 401 / auth error handling ─────────────────────────────────────────────────
+# ── error / auth handling ─────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -514,9 +808,6 @@ async def test_auth_error_does_not_leak_key():
         await get_health()
     assert "test-api-key" not in str(exc_info.value)
     assert "SIGNOZ_API_KEY missing or invalid" in str(exc_info.value)
-
-
-# ── Timeout handling ──────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -544,13 +835,11 @@ async def test_client_omits_variables_field():
 
     def capture(request):
         captured.append(request.content)
-        return Response(200, json=_v5_time_series([]))
+        return Response(200, json=_v5_trace([]))
 
     respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
-    from signoz_mcp.server import count_errors
+    from signoz_mcp.server import search_traces
 
-    await count_errors()
-    import json
-
+    await search_traces(service="svc")
     payload = json.loads(captured[0])
     assert "variables" not in payload, "'variables' field was removed in v5"
