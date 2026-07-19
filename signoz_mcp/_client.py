@@ -10,7 +10,7 @@ import structlog
 
 _log = structlog.get_logger("signoz-mcp")
 
-# v3 was removed in SigNoz v0.118; only v5 is supported.
+# v3/v4 were superseded by v5 in SigNoz v0.118; only v5 is supported.
 _ALLOWED_QUERY_VERSIONS = frozenset({"v5"})
 
 SIGNOZ_URL = os.environ.get("SIGNOZ_URL", "http://localhost:8080").rstrip("/")
@@ -37,6 +37,39 @@ _HTTP_TIMEOUT = 30.0
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _signoz_error_message(resp: httpx.Response) -> str:
+    """Extract SigNoz's structured error message from a non-2xx response.
+
+    SigNoz returns either {"error": {"code": ..., "message": ...}} (v5) or
+    {"error": "..."} (v1). It never echoes the request headers, so the API key
+    can never appear here. Falls back to a bare status code.
+    """
+    try:
+        body = resp.json()
+    except Exception:  # body may not be JSON (e.g. an HTML error page)
+        return f"HTTP {resp.status_code}"
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("code") or f"HTTP {resp.status_code}")
+    if isinstance(err, str) and err:
+        return err
+    return f"HTTP {resp.status_code}"
+
+
+def _check_response(resp: httpx.Response) -> None:
+    """Raise a sanitized error for non-2xx responses; never leak the API key.
+
+    A 401 maps to a fixed auth message. Any other 4xx/5xx surfaces SigNoz's own
+    error text (e.g. "could not find the metric X" for a 404), which is far more
+    actionable than httpx's default "Client error ... for url ..." message and
+    avoids echoing the internal SigNoz URL.
+    """
+    if resp.status_code == 401:
+        raise ValueError("SIGNOZ_API_KEY missing or invalid")
+    if resp.status_code >= 400:
+        raise ValueError(f"SigNoz request failed: {_signoz_error_message(resp)}")
 
 
 def _build_query_payload(
@@ -70,7 +103,7 @@ async def query(
 ) -> dict:
     """POST to /api/{version}/query_range and return the parsed JSON body.
 
-    Raises ValueError with a sanitized message on auth failures.
+    Raises ValueError with a sanitized message on auth or query errors.
     Raises TimeoutError on request timeout.
     Never includes the API key value in any raised exception.
     """
@@ -83,24 +116,25 @@ async def query(
     except httpx.ConnectError as exc:
         raise ConnectionError(f"Could not connect to SigNoz at {SIGNOZ_URL}") from exc
 
-    if resp.status_code == 401:
-        raise ValueError("SIGNOZ_API_KEY missing or invalid")
-    resp.raise_for_status()
+    _check_response(resp)
     return resp.json()
 
 
-async def get(path: str) -> dict:
-    """GET a SigNoz API endpoint and return the parsed JSON body."""
+async def get(path: str, params: dict | None = None) -> dict:
+    """GET a SigNoz API endpoint and return the parsed JSON body.
+
+    Args:
+        path:   API path beginning with '/', e.g. '/api/v2/metrics'.
+        params: Optional query-string parameters (httpx URL-encodes them).
+    """
     url = f"{SIGNOZ_URL}{path}"
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            resp = await client.get(url, headers=_HEADERS)
+            resp = await client.get(url, headers=_HEADERS, params=params)
     except httpx.TimeoutException as exc:
         raise TimeoutError(f"SigNoz did not respond within {_HTTP_TIMEOUT}s") from exc
     except httpx.ConnectError as exc:
         raise ConnectionError(f"Could not connect to SigNoz at {SIGNOZ_URL}") from exc
 
-    if resp.status_code == 401:
-        raise ValueError("SIGNOZ_API_KEY missing or invalid")
-    resp.raise_for_status()
+    _check_response(resp)
     return resp.json()

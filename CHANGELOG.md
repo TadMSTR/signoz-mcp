@@ -1,5 +1,48 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Query-response parsing was broken against live SigNoz v0.118 (SGNZ-8).** The
+  v0.2.0 v3→v5 migration updated the request payloads but never validated the
+  response parsing against a live instance — the 100%-mocked test suite encoded an
+  assumed response shape that did not match reality. The real v5 envelope nests
+  aggregation results under `data.data.results[].aggregations[].series[]`, with
+  labels as a list of `{"key": {"name": ...}, "value": ...}` objects and values as
+  `{"timestamp": ..., "value": ...}` points, and a backend-assigned aggregation
+  `alias` (`__result_0`). As a result:
+  - `count_errors` and `count_log_errors` filtered on `alias == "error_count"` /
+    `"log_error_count"` (never matched) and read `labels`/`values` off the
+    aggregation instead of its `series` — so both **silently returned `[]`** against
+    real data. Now fixed and verified live.
+  - `query_metric` returned raw nested aggregation objects; it now returns clean
+    `{labels: {...}, values: [{timestamp, value}]}` series.
+  - Note: the SGNZ-8 report's premise (that `/api/v5/query_range` 404s and the fix
+    is to switch to `v4`) was incorrect. v5 is the correct, working API on v0.118;
+    the observed 404 was a legitimate "could not find the metric" for a metric name
+    not ingested on forge, and the empty `count_errors` output was this parsing bug.
+- `query_metric`: a 404 for a nonexistent metric now raises a clean
+  `ValueError` with SigNoz's own message (e.g. "could not find the metric X")
+  instead of a raw `httpx.HTTPStatusError`. `_client` now surfaces SigNoz's
+  structured error text for all non-2xx responses without leaking the API key or
+  internal URL.
+- `search_traces` / `tail_logs`: rows are now unwrapped from the v5
+  `{"data": {...}}` per-row envelope before being returned.
+
+### Added
+
+- `list_metrics` is functional again. Instead of returning a hardcoded
+  "endpoint removed in v0.118" error dict, it now sources metric names and
+  metadata from the `GET /api/v2/metrics` endpoint (the same one the official
+  SigNoz MCP server uses), with `search_text`, `start`/`end`, `limit`, and
+  `source` parameters. Returns metric metadata dicts (`metricName`, `type`,
+  `temporality`, `isMonotonic`, ...).
+- `get_field_keys(signal, ...)` — discover filterable field keys for a signal
+  (`metrics`/`traces`/`logs`) via `GET /api/v1/fields/keys`.
+- `get_field_values(signal, name, ...)` — discover values for a specific field
+  key via `GET /api/v1/fields/values`.
+
 ## [0.2.0] — 2026-06-14
 
 ### Breaking
