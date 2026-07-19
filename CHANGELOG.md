@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.0] — 2026-07-19
 
 ### Breaking
 
@@ -59,6 +59,13 @@
   transport and SigNoz compiles the DSL to ClickHouse server-side (not raw SQL);
   this allowlist is defense-in-depth on a read-only API. Flagged to the security
   agent as the build's one deliberate injection-surface expansion.
+- Audit remediation (2026-07-19, LOW): the `operation` shortcut in `search_traces`
+  and `aggregate_traces` is now validated with a strict allowlist (`_validate_operation`,
+  no quotes) instead of the permissive filter-expression allowlist, so it cannot break
+  out of the `name = '<operation>'` string literal it is interpolated into.
+- Audit remediation (2026-07-19, INFO): `get_field_keys`/`get_field_values` now validate
+  `field_context` and `field_data_type` against their documented allowlists, matching the
+  validation applied to the other discovery params.
 
 ### Fixed
 

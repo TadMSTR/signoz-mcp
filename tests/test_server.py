@@ -265,6 +265,32 @@ async def test_search_traces_rejects_bad_filter():
 
 
 @pytest.mark.asyncio
+async def test_search_traces_rejects_operation_with_quotes():
+    """operation must not be able to break out of its 'name = <op>' string literal."""
+    from signoz_mcp.server import search_traces
+
+    with pytest.raises(ValueError):
+        await search_traces(operation="x' OR has_error='true")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_search_traces_accepts_realistic_operation():
+    captured = []
+
+    def capture(request):
+        captured.append(request.content)
+        return Response(200, json=_v5_trace([]))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import search_traces
+
+    await search_traces(operation="tools/call system-ops_run_command")
+    expr = json.loads(captured[0])["compositeQuery"]["queries"][0]["spec"]["filter"]["expression"]
+    assert "name = 'tools/call system-ops_run_command'" in expr
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_search_traces_limit_capped_and_trace_request_type():
     captured = []
@@ -679,6 +705,24 @@ async def test_get_field_keys_rejects_bad_signal():
 
     with pytest.raises(ValueError):
         await get_field_keys(signal="bogus")
+
+
+@pytest.mark.asyncio
+async def test_get_field_keys_rejects_bad_field_context_and_type():
+    from signoz_mcp.server import get_field_keys
+
+    with pytest.raises(ValueError):
+        await get_field_keys(signal="traces", field_context="bogus")
+    with pytest.raises(ValueError):
+        await get_field_keys(signal="traces", field_data_type="notatype")
+
+
+@pytest.mark.asyncio
+async def test_get_field_values_rejects_bad_field_context():
+    from signoz_mcp.server import get_field_values
+
+    with pytest.raises(ValueError):
+        await get_field_values(signal="traces", name="service.name", field_context="bogus")
 
 
 @pytest.mark.asyncio

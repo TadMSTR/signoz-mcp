@@ -88,6 +88,28 @@ _UNIT_MS: dict[str, float] = {
 
 _ALLOWED_SIGNALS = frozenset({"metrics", "traces", "logs"})
 _ALLOWED_SEVERITIES = frozenset({"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"})
+# Operation/span names (e.g. "tools/call system-ops_run_command", "GET /api/v5") — allow
+# spaces/slashes/colons but NOT quotes, so the value cannot break out of the
+# `name = '<operation>'` string literal it is interpolated into (audit LOW, 2026-07-19).
+_OPERATION_RE = re.compile(r"^[A-Za-z0-9._:/ -]+$")
+# Documented allowlists for the SigNoz field discovery params (audit INFO, 2026-07-19).
+_ALLOWED_FIELD_CONTEXTS = frozenset(
+    {"resource", "attribute", "tag", "scope", "log", "span", "metric", "body"}
+)
+_ALLOWED_FIELD_DATA_TYPES = frozenset(
+    {
+        "string",
+        "bool",
+        "int64",
+        "float64",
+        "number",
+        "[]string",
+        "[]bool",
+        "[]int64",
+        "[]float64",
+        "[]number",
+    }
+)
 _ALLOWED_AGGREGATIONS = frozenset(
     {
         "count",
@@ -224,6 +246,20 @@ def _validate_field_name(name: str, what: str = "field name") -> str:
             f"Invalid {what} {name!r}: only alphanumeric, dot, underscore, dash allowed"
         )
     return name
+
+
+def _validate_operation(operation: str) -> str:
+    """Validate a span/operation name before interpolating it into a filter literal.
+
+    Stricter than the free-form filter allowlist: no quotes, so the value cannot break
+    out of the `name = '<operation>'` string literal.
+    """
+    if not _OPERATION_RE.match(operation):
+        raise ValueError(
+            f"Invalid operation {operation!r}: only alphanumeric, dot, underscore, "
+            "colon, slash, dash, and spaces allowed"
+        )
+    return operation
 
 
 def _validate_filter_expr(expr: str) -> str:
@@ -434,7 +470,7 @@ async def search_traces(
         _validate_service(service)
         parts.append(f"service.name = '{service}'")
     if operation:
-        _validate_filter_expr(operation)
+        _validate_operation(operation)
         parts.append(f"name = '{operation}'")
     if has_error:
         parts.append("has_error = true")
@@ -512,7 +548,7 @@ async def aggregate_traces(
         _validate_service(service)
         parts.append(f"service.name = '{service}'")
     if operation:
-        _validate_filter_expr(operation)
+        _validate_operation(operation)
         parts.append(f"name = '{operation}'")
     if error:
         parts.append("has_error = true")
@@ -873,6 +909,16 @@ async def get_field_keys(
         raise ValueError("Invalid search_text: disallowed characters")
     if metric_name and not _METRIC_NAME_RE.match(metric_name):
         raise ValueError("Invalid metric_name: disallowed characters")
+    if field_context and field_context.lower() not in _ALLOWED_FIELD_CONTEXTS:
+        raise ValueError(
+            f"Invalid field_context {field_context!r}: must be one of "
+            f"{sorted(_ALLOWED_FIELD_CONTEXTS)}"
+        )
+    if field_data_type and field_data_type not in _ALLOWED_FIELD_DATA_TYPES:
+        raise ValueError(
+            f"Invalid field_data_type {field_data_type!r}: must be one of "
+            f"{sorted(_ALLOWED_FIELD_DATA_TYPES)}"
+        )
 
     params: dict = {"signal": signal.lower()}
     if search_text:
@@ -917,6 +963,11 @@ async def get_field_values(
         raise ValueError("Invalid search_text: disallowed characters")
     if metric_name and not _METRIC_NAME_RE.match(metric_name):
         raise ValueError("Invalid metric_name: disallowed characters")
+    if field_context and field_context.lower() not in _ALLOWED_FIELD_CONTEXTS:
+        raise ValueError(
+            f"Invalid field_context {field_context!r}: must be one of "
+            f"{sorted(_ALLOWED_FIELD_CONTEXTS)}"
+        )
 
     params: dict = {"signal": signal.lower(), "name": name}
     if search_text:
