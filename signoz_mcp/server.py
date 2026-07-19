@@ -4,12 +4,14 @@ Read-only access to SigNoz services, traces, logs, metrics, and alert rules.
 Gives agents direct query access without requiring a Grafana or SigNoz UI session.
 
 Tools:
-  list_services      — All services with RED metrics
-  count_errors       — Error span count grouped by service
-  search_traces      — Filter traces by service, error state, min duration
-  tail_logs          — Recent logs for a service filtered by severity
-  count_log_errors   — Error/warn log rate over time
-  query_metric       — Named metric with optional label filter
+  list_services      — All service names registered in SigNoz
+  search_traces      — Search traces by free-form filter + shortcut params
+  aggregate_traces   — Aggregate traces (count/p99/avg/...) grouped by field(s)
+  get_trace_details  — Full span list for one trace ID
+  tail_logs          — Recent logs filtered by severity
+  search_logs        — Search logs by free-form filter + shortcut params
+  aggregate_logs     — Aggregate logs (count/...) grouped by field(s)
+  query_metric       — Named metric time series with optional label filter
   list_metrics       — Search/list ingested metric names + metadata
   get_field_keys     — Discover filterable field keys for a signal
   get_field_values   — Discover values for a specific field key
@@ -23,12 +25,12 @@ Configuration:
 
 API compatibility:
   This server targets the SigNoz v5 query_range API used by v0.118. The v5
-  response envelope nests aggregation results under
-  data.data.results[].aggregations[].series[], with labels as a list of
-  {"key": {"name": ...}, "value": ...} objects and values as
-  {"timestamp": ..., "value": ...} points — parsed by the _iter_agg_series /
-  _extract_rows helpers below. Metric and field listings use the v2/v1 REST
-  endpoints (/api/v2/metrics, /api/v1/fields/keys, /api/v1/fields/values).
+  time_series envelope nests results under
+  data.data.results[].aggregations[].series[] (labels as a list of
+  {"key": {"name": ...}, "value": ...}, values as {"timestamp": ..., "value": ...});
+  the scalar envelope uses results[].columns + results[].data (a column-aligned
+  table). Both are handled by the parsing helpers below. Metric and field
+  listings use the v2/v1 REST endpoints.
 """
 
 from __future__ import annotations
@@ -45,20 +47,29 @@ _log = structlog.get_logger("signoz-mcp")
 
 _SERVICE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _METRIC_NAME_RE = re.compile(r"^[a-zA-Z0-9._:/-]+$")
-# Discovery search substrings and field names are sent as URL query params (httpx
-# URL-encodes them), not spliced into a SQL filter expression — but we still keep
-# them on a conservative allowlist to bound the injection surface.
-_SEARCH_TEXT_RE = re.compile(r"^[a-zA-Z0-9._:/ -]*$")
 _FIELD_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
-# Allowlist for SigNoz label_filter expressions: identifiers, comparisons, string literals,
-# logical operators (AND/OR/IN as plain letters), list brackets, commas, whitespace.
-_LABEL_FILTER_RE = re.compile(r"^[a-zA-Z0-9_.='<>!()\[\]\s,]+$")
-_MAX_LABEL_FILTER_LEN = 500
+# Discovery search substrings are sent as URL query params (httpx URL-encodes
+# them), not spliced into a filter expression — but kept on a conservative
+# allowlist to bound the injection surface.
+_SEARCH_TEXT_RE = re.compile(r"^[a-zA-Z0-9._:/ -]*$")
+
+# Filter-expression allowlist for SigNoz's structured query DSL. Permits identifiers
+# with dots/dashes/colons/slashes (service.name = 'scoped-mcp-developer', body CONTAINS
+# '/api/v5'), comparison + logical operators, string literals, IN-lists, and grouping.
+# Deliberately EXCLUDES ; ` \ and control characters. The expression is JSON-encoded
+# before transport (no context breakout) and SigNoz compiles the DSL to ClickHouse
+# server-side (not raw SQL passthrough); this allowlist is defense-in-depth on a
+# read-only API. See docs — expansion beyond the v3-era label allowlist is intentional
+# and was flagged to the security agent (free-form filter surface).
+_FILTER_EXPR_RE = re.compile(r"^[A-Za-z0-9_.:/@%+\-\s='\"<>!()\[\],]*$")
+_MAX_FILTER_LEN = 1000
+# Retained name for the historical LOW-01 metric label_filter control (now unified
+# onto the filter-expression allowlist).
+_LABEL_FILTER_RE = _FILTER_EXPR_RE
+_MAX_LABEL_FILTER_LEN = _MAX_FILTER_LEN
 
 _MAX_LIMIT_RAW = 500
 _MAX_LIMIT_AGG = 10_000
-_MAX_RANGE_RAW_MS = 24 * 3600 * 1000
-_MAX_RANGE_AGG_MS = 7 * 24 * 3600 * 1000
 
 _DURATION_RE = re.compile(r"^-?(?P<value>\d+(?:\.\d+)?)(?P<unit>[smhdw])$", re.IGNORECASE)
 _UNIT_MS: dict[str, float] = {
@@ -70,18 +81,38 @@ _UNIT_MS: dict[str, float] = {
 }
 
 _ALLOWED_SIGNALS = frozenset({"metrics", "traces", "logs"})
+_ALLOWED_SEVERITIES = frozenset({"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"})
+_ALLOWED_AGGREGATIONS = frozenset(
+    {
+        "count",
+        "count_distinct",
+        "avg",
+        "sum",
+        "min",
+        "max",
+        "p50",
+        "p75",
+        "p90",
+        "p95",
+        "p99",
+        "rate",
+    }
+)
+# count() and rate() take no field argument.
+_NO_FIELD_AGGREGATIONS = frozenset({"count", "rate"})
+_ALLOWED_REQUEST_TYPES = frozenset({"scalar", "time_series"})
 
 mcp = FastMCP(
     name="signoz",
     instructions=(
         "SigNoz MCP server. Read-only access to observability data on forge. "
-        "Use list_services to see all services and their RED metrics. "
-        "Use count_errors / search_traces for trace-level investigation. "
-        "Use tail_logs / count_log_errors for log analysis. "
-        "Use query_metric / list_metrics for metrics queries. "
-        "Use get_field_keys / get_field_values to discover filterable fields. "
-        "Use list_alert_rules to check firing alerts. "
-        "Use get_health to confirm connectivity. "
+        "Use list_services to see all services. "
+        "Use search_traces / aggregate_traces / get_trace_details for trace investigation. "
+        "Use tail_logs / search_logs / aggregate_logs for log analysis. "
+        "Use query_metric / list_metrics for metrics. "
+        "Use get_field_keys / get_field_values to discover filterable fields before "
+        "building a filter expression. "
+        "Use list_alert_rules to check firing alerts, get_health for connectivity. "
         "All tools are read-only — SigNoz write endpoints are never exposed."
     ),
 )
@@ -118,7 +149,7 @@ def _parse_time_ms(expr: str) -> int:
     return _parse_duration_ms(expr)
 
 
-_ALLOWED_SEVERITIES = frozenset({"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"})
+# ── Input validation ──────────────────────────────────────────────────────────
 
 
 def _validate_service(service: str) -> str:
@@ -146,17 +177,77 @@ def _validate_signal(signal: str) -> str:
     return sig
 
 
+def _validate_field_name(name: str, what: str = "field name") -> str:
+    if not _FIELD_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid {what} {name!r}: only alphanumeric, dot, underscore, dash allowed"
+        )
+    return name
+
+
+def _validate_filter_expr(expr: str) -> str:
+    """Validate a free-form SigNoz filter expression against the allowlist.
+
+    Security-relevant: this is the free-form injection surface into the SigNoz
+    query API. The expression is JSON-encoded before transport and SigNoz parses
+    it as a structured DSL server-side; this allowlist is defense-in-depth.
+    """
+    if len(expr) > _MAX_FILTER_LEN:
+        raise ValueError(f"filter too long: max {_MAX_FILTER_LEN} chars")
+    if not _FILTER_EXPR_RE.match(expr):
+        raise ValueError(
+            "Invalid filter expression: contains disallowed characters. Allowed: "
+            "letters, digits, _ . : / @ % + - and = ' \" < > ! ( ) [ ] , plus whitespace"
+        )
+    return expr
+
+
+def _build_agg_expression(aggregation: str, aggregate_on: str) -> str:
+    """Build a SigNoz aggregation expression like 'count()' or 'p99(duration_nano)'."""
+    agg = aggregation.lower()
+    if agg not in _ALLOWED_AGGREGATIONS:
+        raise ValueError(
+            f"Invalid aggregation {aggregation!r}: must be one of {sorted(_ALLOWED_AGGREGATIONS)}"
+        )
+    if agg in _NO_FIELD_AGGREGATIONS:
+        return f"{agg}()"
+    if not aggregate_on:
+        raise ValueError(f"aggregation {agg!r} requires aggregate_on (a field name)")
+    _validate_field_name(aggregate_on, "aggregate_on")
+    return f"{agg}({aggregate_on})"
+
+
+def _build_group_by(group_by: str) -> list[dict]:
+    """Parse a comma-separated field list into v5 groupBy keys."""
+    keys = []
+    for raw in group_by.split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        _validate_field_name(name, "group_by field")
+        keys.append({"name": name})
+    return keys
+
+
+def _build_order(order_by: str, default_expr: str) -> list[dict]:
+    """Parse an 'order_by' string ('<field> <asc|desc>') into a v5 order clause.
+
+    Empty order_by defaults to the aggregation expression, descending.
+    """
+    if not order_by.strip():
+        return [{"key": {"name": default_expr}, "direction": "desc"}]
+    parts = order_by.split()
+    field = parts[0]
+    direction = parts[1].lower() if len(parts) > 1 else "desc"
+    if direction not in {"asc", "desc"}:
+        raise ValueError("order_by direction must be 'asc' or 'desc'")
+    # The field may be an aggregation expression like 'p99(duration_nano)'; validate
+    # it through the filter-expression allowlist which permits parens.
+    _validate_filter_expr(field)
+    return [{"key": {"name": field}, "direction": direction}]
+
+
 # ── v5 query_range response parsing ───────────────────────────────────────────
-#
-# The v5 envelope is:
-#   {"data": {"data": {"results": [
-#       {"queryName": "A",
-#        "aggregations": [{"alias": "__result_0",
-#                          "series": [{"labels": [{"key": {"name": K}, "value": V}, ...],
-#                                      "values": [{"timestamp": T, "value": N}, ...]}]}],
-#        "rows": [{"data": {...}}, ...]}]}}}
-# Aggregation aliases are backend-assigned ("__result_0"), so parsers must be
-# alias-agnostic and read labels/values out of series[], NOT off the aggregation.
 
 
 def _v5_results(body: dict) -> list[dict]:
@@ -225,6 +316,32 @@ def _extract_rows(body: dict) -> list[dict]:
     return rows
 
 
+def _parse_scalar_rows(body: dict) -> list[dict]:
+    """Parse a v5 scalar response (columns + column-aligned data table) into dicts.
+
+    Scalar results look like:
+      {"columns": [{"name": "service.name"}, {"name": "__result_0"}],
+       "data": [["svc-a", 1835], ["svc-b", 932]]}
+    → [{"service.name": "svc-a", "__result_0": 1835}, ...]
+    """
+    rows: list[dict] = []
+    for r in _v5_results(body):
+        columns = [c.get("name") for c in r.get("columns") or []]
+        for row in r.get("data") or []:
+            if isinstance(row, (list, tuple)):
+                rows.append(dict(zip(columns, row, strict=False)))
+            elif isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def _parse_aggregate(body: dict, request_type: str) -> list[dict]:
+    """Shape an aggregate response by request type (scalar table vs time series)."""
+    if request_type == "scalar":
+        return _parse_scalar_rows(body)
+    return [{"labels": labels, "values": values} for labels, values in _iter_agg_series(body)]
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 
@@ -240,87 +357,183 @@ async def list_services() -> list[str]:
 
 
 @mcp.tool()
-async def count_errors(
+async def search_traces(
+    filter: str = "",
+    service: str = "",
+    operation: str = "",
+    has_error: bool = False,
+    min_duration_ms: int = 0,
+    max_duration_ms: int = 0,
     start: str = "-1h",
     end: str = "now",
-    limit: int = 20,
+    limit: int = 100,
+    offset: int = 0,
 ) -> list[dict]:
-    """Count error spans grouped by service over a time range.
+    """Search traces by a free-form filter expression plus shortcut params.
 
     Args:
-        start: Start time, e.g. '-1h', '-30m', '-7d'.
-        end:   End time. Defaults to 'now'.
-        limit: Max services to return (max 10000).
+        filter:          Free-form SigNoz filter expression, e.g.
+                         "service.name = 'frontend' AND http.status_code = 500".
+                         Combined with the shortcut params below via AND.
+        service:         Shortcut for "service.name = '<service>'".
+        operation:       Shortcut for "name = '<operation>'" (span/operation name).
+        has_error:       Shortcut for "has_error = true".
+        min_duration_ms: Shortcut for "duration_nano >= <ms * 1e6>". 0 = no filter.
+        max_duration_ms: Shortcut for "duration_nano <= <ms * 1e6>". 0 = no filter.
+        start:           Start time, e.g. '-1h'. end: end time (default 'now').
+        limit:           Max traces to return (max 500). offset: pagination offset.
 
     Returns:
-        List of dicts with serviceName and error_count, sorted descending.
+        List of trace dicts (trace_id, name, service.name, duration_nano, span_count, ...).
     """
+    parts: list[str] = []
+    if filter:
+        parts.append(_validate_filter_expr(filter))
+    if service:
+        _validate_service(service)
+        parts.append(f"service.name = '{service}'")
+    if operation:
+        _validate_filter_expr(operation)
+        parts.append(f"name = '{operation}'")
+    if has_error:
+        parts.append("has_error = true")
+    if min_duration_ms > 0:
+        parts.append(f"duration_nano >= {int(min_duration_ms) * 1_000_000}")
+    if max_duration_ms > 0:
+        parts.append(f"duration_nano <= {int(max_duration_ms) * 1_000_000}")
+
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
-    limit = min(limit, _MAX_LIMIT_AGG)
+    limit = min(max(limit, 1), _MAX_LIMIT_RAW)
 
-    spec = {
-        "stepInterval": 60,
-        "aggregations": [{"expression": "count()", "alias": "error_count"}],
-        "filter": {"expression": "hasError = true"},
-        "groupBy": [{"name": "serviceName"}],
-        "order": [{"key": {"name": "error_count"}, "direction": "desc"}],
+    spec: dict = {
+        "order": [{"key": {"name": "timestamp"}, "direction": "desc"}],
         "limit": limit,
+        "offset": max(offset, 0),
     }
-    body = await client.query("traces", "time_series", spec, start_ms, end_ms)
-    rows = [
-        {
-            "serviceName": labels.get("serviceName", ""),
-            "error_count": _sum_series_values(values),
-        }
-        for labels, values in _iter_agg_series(body)
-    ]
-    rows.sort(key=lambda r: r["error_count"], reverse=True)
-    return rows
+    if parts:
+        spec["filter"] = {"expression": " AND ".join(parts)}
+
+    body = await client.query("traces", "trace", spec, start_ms, end_ms)
+    return _extract_rows(body)[:limit]
 
 
 @mcp.tool()
-async def search_traces(
-    service: str,
-    has_error: bool = False,
+async def aggregate_traces(
+    aggregation: str,
+    aggregate_on: str = "",
+    group_by: str = "",
+    filter: str = "",
+    service: str = "",
+    operation: str = "",
+    error: bool = False,
     min_duration_ms: int = 0,
+    max_duration_ms: int = 0,
+    order_by: str = "",
+    limit: int = 100,
     start: str = "-1h",
     end: str = "now",
-    limit: int = 20,
+    request_type: str = "scalar",
+    step_interval: int = 60,
 ) -> list[dict]:
-    """Search traces filtered by service, error state, and minimum duration.
+    """Aggregate traces with a function grouped by field(s).
+
+    Replaces the removed count_errors tool, e.g.
+    aggregate_traces(aggregation="count", filter="has_error = true",
+                     group_by="service.name").
 
     Args:
-        service:         Service name to filter on.
-        has_error:       If True, return only error spans.
-        min_duration_ms: Minimum span duration in milliseconds. 0 = no filter.
-        start:           Start time, e.g. '-1h'.
-        end:             End time. Defaults to 'now'.
-        limit:           Max traces to return (max 500).
+        aggregation:   One of count, count_distinct, avg, sum, min, max,
+                       p50/p75/p90/p95/p99, rate. count/rate take no aggregate_on.
+        aggregate_on:  Field to aggregate, e.g. 'duration_nano' (required unless
+                       aggregation is count/rate).
+        group_by:      Comma-separated field names, e.g. 'service.name,name'.
+        filter:        Free-form filter expression (AND-combined with shortcuts).
+        service/operation/error/min_duration_ms/max_duration_ms: shortcut filters.
+        order_by:      '<field> <asc|desc>'. Default: the aggregation expr, desc.
+        limit:         Max groups (max 10000).
+        request_type:  'scalar' (single value per group) or 'time_series'.
+        step_interval: Step in seconds (time_series only).
 
     Returns:
-        List of trace dicts (trace_id, name, service.name, duration_nano, ...).
+        scalar → list of {<group field>: value, __result_0: number} dicts.
+        time_series → list of {labels, values} series dicts.
     """
-    _validate_service(service)
+    agg_expr = _build_agg_expression(aggregation, aggregate_on)
+    req_type = request_type.lower()
+    if req_type not in _ALLOWED_REQUEST_TYPES:
+        raise ValueError(f"request_type must be one of {sorted(_ALLOWED_REQUEST_TYPES)}")
+
+    parts: list[str] = []
+    if filter:
+        parts.append(_validate_filter_expr(filter))
+    if service:
+        _validate_service(service)
+        parts.append(f"service.name = '{service}'")
+    if operation:
+        _validate_filter_expr(operation)
+        parts.append(f"name = '{operation}'")
+    if error:
+        parts.append("has_error = true")
+    if min_duration_ms > 0:
+        parts.append(f"duration_nano >= {int(min_duration_ms) * 1_000_000}")
+    if max_duration_ms > 0:
+        parts.append(f"duration_nano <= {int(max_duration_ms) * 1_000_000}")
+
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
-    limit = min(limit, _MAX_LIMIT_RAW)
+    limit = min(max(limit, 1), _MAX_LIMIT_AGG)
 
-    filters = [f"serviceName = '{service}'"]
-    if has_error:
-        filters.append("hasError = true")
-    if min_duration_ms > 0:
-        filters.append(f"durationNano >= {min_duration_ms * 1_000_000}")
-    filter_expr = " AND ".join(filters)
-
-    spec = {
-        "stepInterval": 60,
-        "filter": {"expression": filter_expr},
-        "order": [{"key": {"name": "timestamp"}, "direction": "desc"}],
+    spec: dict = {
+        "aggregations": [{"expression": agg_expr}],
+        "order": _build_order(order_by, agg_expr),
         "limit": limit,
     }
-    body = await client.query("traces", "trace", spec, start_ms, end_ms)
-    return _extract_rows(body)[:limit]
+    group_keys = _build_group_by(group_by)
+    if group_keys:
+        spec["groupBy"] = group_keys
+    if parts:
+        spec["filter"] = {"expression": " AND ".join(parts)}
+    if req_type == "time_series":
+        spec["stepInterval"] = step_interval
+
+    body = await client.query("traces", req_type, spec, start_ms, end_ms)
+    return _parse_aggregate(body, req_type)
+
+
+@mcp.tool()
+async def get_trace_details(
+    trace_id: str,
+    start: str = "-6h",
+    end: str = "now",
+    include_spans: bool = True,
+) -> list[dict]:
+    """Return the spans (or a one-row summary) for a single trace ID.
+
+    Args:
+        trace_id:      Trace ID (hex). Validated before use.
+        start:         Start of the search window (default '-6h'). end: default 'now'.
+        include_spans: If True (default), return every span in the trace
+                       (span_id, name, service.name, duration_nano, timestamp, ...).
+                       If False, return a single trace-summary row (span_count).
+
+    Returns:
+        List of span dicts (include_spans=True) or a one-item summary list.
+    """
+    if not re.fullmatch(r"[A-Fa-f0-9]{1,64}", trace_id):
+        raise ValueError(f"Invalid trace_id {trace_id!r}: expected a hex string (up to 64 chars)")
+    start_ms = _parse_time_ms(start)
+    end_ms = _parse_time_ms(end)
+
+    spec = {
+        "filter": {"expression": f"trace_id = '{trace_id}'"},
+        "order": [{"key": {"name": "timestamp"}, "direction": "asc"}],
+        "limit": 1000,
+    }
+    # requestType 'raw' returns individual spans; 'trace' returns a trace summary row.
+    request_type = "raw" if include_spans else "trace"
+    body = await client.query("traces", request_type, spec, start_ms, end_ms)
+    return _extract_rows(body)
 
 
 @mcp.tool()
@@ -331,14 +544,18 @@ async def tail_logs(
     end: str = "now",
     limit: int = 50,
 ) -> list[dict]:
-    """Return recent logs for a service filtered by severity.
+    """Return recent logs filtered by severity.
 
     Args:
-        service:  Service name to filter on.
+        service:  Service name (validated; recorded for context — see note).
         severity: Log severity level, e.g. 'ERROR', 'WARN', 'INFO'. Case-insensitive.
-        start:    Start time, e.g. '-1h'.
-        end:      End time. Defaults to 'now'.
+        start:    Start time, e.g. '-1h'. end: end time (default 'now').
         limit:    Max log lines to return (max 500).
+
+    Note:
+        In forge's v5 log schema, service name is a resource attribute that is not
+        reliably filterable in the log filter parser, so this tool filters on
+        severity_text only. Use search_logs(filter=...) for richer log filtering.
 
     Returns:
         List of log dicts with timestamp, severity_text, body, and resource fields.
@@ -349,14 +566,8 @@ async def tail_logs(
     end_ms = _parse_time_ms(end)
     limit = min(limit, _MAX_LIMIT_RAW)
 
-    # In the v5 logs schema, service name is a resource attribute (resource.service.name)
-    # and cannot be used in filter expressions directly — only in groupBy.
-    # Filter on severity_text only; callers should narrow time range for service-level queries.
-    filter_expr = f"severity_text = '{sev}'"
-
     spec = {
-        "stepInterval": 60,
-        "filter": {"expression": filter_expr},
+        "filter": {"expression": f"severity_text = '{sev}'"},
         "order": [{"key": {"name": "timestamp"}, "direction": "desc"}],
         "limit": limit,
     }
@@ -365,44 +576,134 @@ async def tail_logs(
 
 
 @mcp.tool()
-async def count_log_errors(
+async def search_logs(
+    filter: str = "",
+    service: str = "",
+    severity: str = "",
+    search_text: str = "",
     start: str = "-1h",
     end: str = "now",
-    limit: int = 20,
+    limit: int = 100,
+    offset: int = 0,
 ) -> list[dict]:
-    """Count error/warn log events grouped by service over a time range.
+    """Search logs by a free-form filter expression plus shortcut params.
 
     Args:
-        start: Start time, e.g. '-1h'.
-        end:   End time. Defaults to 'now'.
-        limit: Max services to return (max 10000).
+        filter:      Free-form SigNoz filter expression, AND-combined with shortcuts.
+        service:     Shortcut for "service.name = '<service>'". Note: forge's log
+                     pipeline may not index service.name as filterable — this can
+                     return a parse error; prefer narrowing by time + severity.
+        severity:    Shortcut for "severity_text = '<SEVERITY>'".
+        search_text: Shortcut for "body CONTAINS '<text>'" (log body substring).
+        start:       Start time (default '-1h'). end: end time (default 'now').
+        limit:       Max log lines (max 500). offset: pagination offset.
 
     Returns:
-        List of dicts with serviceName and log_error_count, sorted descending.
+        List of log dicts (timestamp, severity_text, body, resource fields, ...).
     """
+    parts: list[str] = []
+    if filter:
+        parts.append(_validate_filter_expr(filter))
+    if service:
+        _validate_service(service)
+        parts.append(f"service.name = '{service}'")
+    if severity:
+        parts.append(f"severity_text = '{_validate_severity(severity)}'")
+    if search_text:
+        if not _SEARCH_TEXT_RE.match(search_text):
+            raise ValueError("Invalid search_text: disallowed characters")
+        parts.append(f"body CONTAINS '{search_text}'")
+
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
-    limit = min(limit, _MAX_LIMIT_AGG)
+    limit = min(max(limit, 1), _MAX_LIMIT_RAW)
 
-    spec = {
-        "stepInterval": 60,
-        "aggregations": [{"expression": "count()", "alias": "log_error_count"}],
-        "filter": {"expression": "severity_text IN ['ERROR', 'WARN']"},
-        # In the v5 logs schema, service name is stored as a resource attribute.
-        "groupBy": [{"name": "resource.service.name"}],
-        "order": [{"key": {"name": "log_error_count"}, "direction": "desc"}],
+    spec: dict = {
+        "order": [{"key": {"name": "timestamp"}, "direction": "desc"}],
+        "limit": limit,
+        "offset": max(offset, 0),
+    }
+    if parts:
+        spec["filter"] = {"expression": " AND ".join(parts)}
+
+    body = await client.query("logs", "raw", spec, start_ms, end_ms)
+    return _extract_rows(body)[:limit]
+
+
+@mcp.tool()
+async def aggregate_logs(
+    aggregation: str,
+    aggregate_on: str = "",
+    group_by: str = "",
+    filter: str = "",
+    service: str = "",
+    severity: str = "",
+    search_text: str = "",
+    order_by: str = "",
+    limit: int = 100,
+    start: str = "-1h",
+    end: str = "now",
+    request_type: str = "scalar",
+    step_interval: int = 60,
+) -> list[dict]:
+    """Aggregate logs with a function grouped by field(s).
+
+    Replaces the removed count_log_errors tool, e.g.
+    aggregate_logs(aggregation="count", filter="severity_text IN ['ERROR', 'WARN']",
+                   group_by="resource.service.name").
+
+    Args:
+        aggregation:   One of count, count_distinct, avg, sum, min, max,
+                       p50/p75/p90/p95/p99, rate. count/rate take no aggregate_on.
+        aggregate_on:  Field to aggregate (required unless count/rate).
+        group_by:      Comma-separated field names, e.g. 'resource.service.name'.
+        filter:        Free-form filter expression (AND-combined with shortcuts).
+        service/severity/search_text: shortcut filters (see search_logs).
+        order_by:      '<field> <asc|desc>'. Default: the aggregation expr, desc.
+        limit:         Max groups (max 10000).
+        request_type:  'scalar' or 'time_series'. step_interval: seconds (time_series).
+
+    Returns:
+        scalar → list of {<group field>: value, __result_0: number} dicts.
+        time_series → list of {labels, values} series dicts.
+    """
+    agg_expr = _build_agg_expression(aggregation, aggregate_on)
+    req_type = request_type.lower()
+    if req_type not in _ALLOWED_REQUEST_TYPES:
+        raise ValueError(f"request_type must be one of {sorted(_ALLOWED_REQUEST_TYPES)}")
+
+    parts: list[str] = []
+    if filter:
+        parts.append(_validate_filter_expr(filter))
+    if service:
+        _validate_service(service)
+        parts.append(f"service.name = '{service}'")
+    if severity:
+        parts.append(f"severity_text = '{_validate_severity(severity)}'")
+    if search_text:
+        if not _SEARCH_TEXT_RE.match(search_text):
+            raise ValueError("Invalid search_text: disallowed characters")
+        parts.append(f"body CONTAINS '{search_text}'")
+
+    start_ms = _parse_time_ms(start)
+    end_ms = _parse_time_ms(end)
+    limit = min(max(limit, 1), _MAX_LIMIT_AGG)
+
+    spec: dict = {
+        "aggregations": [{"expression": agg_expr}],
+        "order": _build_order(order_by, agg_expr),
         "limit": limit,
     }
-    body = await client.query("logs", "time_series", spec, start_ms, end_ms)
-    rows = [
-        {
-            "serviceName": labels.get("resource.service.name", ""),
-            "log_error_count": _sum_series_values(values),
-        }
-        for labels, values in _iter_agg_series(body)
-    ]
-    rows.sort(key=lambda r: r["log_error_count"], reverse=True)
-    return rows
+    group_keys = _build_group_by(group_by)
+    if group_keys:
+        spec["groupBy"] = group_keys
+    if parts:
+        spec["filter"] = {"expression": " AND ".join(parts)}
+    if req_type == "time_series":
+        spec["stepInterval"] = step_interval
+
+    body = await client.query("logs", req_type, spec, start_ms, end_ms)
+    return _parse_aggregate(body, req_type)
 
 
 @mcp.tool()
@@ -418,8 +719,7 @@ async def query_metric(
     Args:
         metric_name:   Metric name, e.g. 'scoped_mcp.credentials.healthy'.
         label_filter:  Optional filter expression, e.g. "state = 'idle'".
-        start:         Start time, e.g. '-1h'.
-        end:           End time. Defaults to 'now'.
+        start:         Start time, e.g. '-1h'. end: end time (default 'now').
         step_interval: Aggregation step in seconds.
 
     Returns:
@@ -431,15 +731,11 @@ async def query_metric(
             f"Invalid metric name {metric_name!r}: "
             "only alphanumeric, dot, underscore, colon, slash, dash allowed"
         )
-    if label_filter and len(label_filter) > _MAX_LABEL_FILTER_LEN:
-        raise ValueError(f"label_filter too long: max {_MAX_LABEL_FILTER_LEN} chars")
-    # SECURITY[resolved]: Validate label_filter against allowlist regex before passing to
-    # SigNoz query API. LOW-01 from 2026-05-30/signoz-mcp-deploy-2026-05.
-    if label_filter and not _LABEL_FILTER_RE.match(label_filter):
-        raise ValueError(
-            "Invalid label_filter: only alphanumeric, _  .  =  '  <  >  !  ()  []  ,  "
-            "and whitespace allowed"
-        )
+    # SECURITY[resolved]: validate label_filter against the filter-expression
+    # allowlist before passing to the SigNoz query API. LOW-01 from
+    # 2026-05-30/signoz-mcp-deploy-2026-05, unified onto _FILTER_EXPR_RE.
+    if label_filter:
+        _validate_filter_expr(label_filter)
 
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
@@ -478,8 +774,7 @@ async def list_metrics(
 
     Args:
         search_text: Filter metric names by substring, e.g. 'cpu'. Empty = all.
-        start:       Start of the discovery window, e.g. '-1h'.
-        end:         End of the discovery window. Defaults to 'now'.
+        start:       Start of the discovery window, e.g. '-1h'. end: default 'now'.
         limit:       Max metrics to return (max 500).
         source:      Optional data-source filter. Use 'meter' for Cost Meter
                      usage metrics; omit for the default metrics store.
@@ -576,10 +871,7 @@ async def get_field_values(
     _validate_signal(signal)
     if not name:
         raise ValueError("name is required")
-    if not _FIELD_NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid field name {name!r}: only alphanumeric, dot, underscore, dash allowed"
-        )
+    _validate_field_name(name)
     if search_text and not _SEARCH_TEXT_RE.match(search_text):
         raise ValueError("Invalid search_text: disallowed characters")
     if metric_name and not _METRIC_NAME_RE.match(metric_name):

@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- **`count_errors` removed** — subsumed by
+  `aggregate_traces(aggregation="count", filter="has_error = true", group_by="service.name")`.
+- **`count_log_errors` removed** — subsumed by
+  `aggregate_logs(aggregation="count", filter="severity_text IN ['ERROR', 'WARN']", group_by="resource.service.name")`.
+- **`search_traces` signature changed** — was
+  `search_traces(service, has_error, min_duration_ms, start, end, limit)` with a
+  required `service`; now `search_traces(filter="", service="", operation="",
+  has_error=False, min_duration_ms=0, max_duration_ms=0, start, end, limit=100,
+  offset=0)`. All params are optional; `filter` accepts a free-form SigNoz filter
+  expression AND-combined with the shortcut params. Default `limit` is now 100
+  (was 20). Trace field names in generated filters use the v5-canonical dotted
+  form (`service.name`, `has_error`, `duration_nano`).
+
+### Added
+
+- `aggregate_traces(...)` / `aggregate_logs(...)` — generic aggregation tools
+  (count/count_distinct/avg/sum/min/max/p50–p99/rate) with `group_by`, free-form
+  `filter` + shortcut params, and `request_type` `scalar` (default) or
+  `time_series`. Scalar responses are parsed from the v5 columns/data table shape.
+- `search_logs(...)` — free-form log search (filter + service/severity/search_text
+  shortcuts; `search_text` does `body CONTAINS`).
+- `get_trace_details(trace_id, start, end, include_spans=True)` — returns every
+  span in a trace (`include_spans=True`, via the `raw` request type) or a one-row
+  trace summary (`include_spans=False`, via the `trace` request type).
+
+### Security
+
+- Introduced `_FILTER_EXPR_RE`, an expanded filter-expression allowlist for the
+  new free-form `filter` params (and unified `query_metric`'s `label_filter` onto
+  it). It now permits `- : / @ %` (real service names have dashes; log-body
+  filters have slashes) while still excluding `;` `` ` `` `\\` and control
+  characters, with a 1000-char cap. The expression is JSON-encoded before
+  transport and SigNoz compiles the DSL to ClickHouse server-side (not raw SQL);
+  this allowlist is defense-in-depth on a read-only API. Flagged to the security
+  agent as the build's one deliberate injection-surface expansion.
+
 ### Fixed
 
 - **Query-response parsing was broken against live SigNoz v0.118 (SGNZ-8).** The
