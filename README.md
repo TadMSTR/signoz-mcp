@@ -11,7 +11,7 @@ Targets the SigNoz **v5** query API (v0.118+).
 
 | Tool | Description |
 |------|-------------|
-| `list_services` | All registered service names — returns `list[str]` |
+| `list_services` | Services seen in a time window, with their RED metrics — returns `list[dict]` (`serviceName`, `p99`, `avgDuration`, `numCalls`, `callRate`, `numErrors`, `errorRate`, `num4XX`, `fourXXRate`). Takes `start`/`end` |
 | `search_traces` | Search traces by a free-form filter expression + shortcut params (service, operation, error, duration bounds) |
 | `aggregate_traces` | Aggregate traces (count/count_distinct/avg/sum/min/max/p50–p99/rate) grouped by field(s); scalar or time_series |
 | `get_trace_details` | Every span in a trace (`include_spans=True`) or a one-row trace summary |

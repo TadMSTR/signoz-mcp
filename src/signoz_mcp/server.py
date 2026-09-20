@@ -422,15 +422,71 @@ def _parse_aggregate(body: dict, request_type: str) -> list[dict]:
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 
+# Fields returned per service by POST /api/v1/services, in the order they are
+# presented. `dataWarning` is deliberately dropped: its only member is
+# `topLevelOps`, which includes SigNoz's synthetic "overflow_operation" entry and
+# is noise in a fleet listing. Everything here is SigNoz's own field name —
+# renaming them would invent a mapping this server would then have to keep true.
+_SERVICE_FIELDS = (
+    "serviceName",
+    "p99",
+    "avgDuration",
+    "numCalls",
+    "callRate",
+    "numErrors",
+    "errorRate",
+    "num4XX",
+    "fourXXRate",
+)
+
+
 @tool
-async def list_services() -> list[str]:
-    """List all service names registered in SigNoz.
+async def list_services(start: str = "-1h", end: str = "now") -> list[dict]:
+    """List services seen in SigNoz within a time window, with their RED metrics.
+
+    Args:
+        start: Window start — relative duration ('-24h', '-7d') or 'now'.
+        end:   Window end — same format. Defaults to 'now'.
 
     Returns:
-        List of service name strings.
+        One dict per service, each carrying SigNoz's own field names:
+        `serviceName`, `p99` and `avgDuration` (NANOSECONDS — verified against
+        `p99(duration_nano)` from the trace aggregate, same order of magnitude),
+        `numCalls`, `callRate`, `numErrors`, `errorRate`, `num4XX`, `fourXXRate`.
+
+        Note that `p99`/`avgDuration` are computed over each service's TOP-LEVEL
+        operations, not every span, so they do not match
+        `aggregate_traces(p99(duration_nano))` exactly. Measured 2026-09-20 the
+        two agree within ~7% for most services and diverge up to 2x for services
+        with deep span trees. Use `aggregate_traces` when you need all spans.
     """
-    data = await client.get("/api/v1/services/list")
-    return data if isinstance(data, list) else []
+    # vikunja#322. This used GET /api/v1/services/list, which takes NO time range
+    # and applies its own short implicit window. Measured live on 2026-09-20
+    # against SigNoz v0.118.0: that endpoint returned 16 services regardless of
+    # window, while this POST form returned 21 at 24h and 25 at 7d — set-identical
+    # to aggregate_traces(count, group_by=service.name) at BOTH windows. Nine
+    # services were missing over 7 days, including scoped-mcp-doc-health and
+    # memsearch-summarize.
+    #
+    # `start` and `end` MUST be JSON STRINGS of nanoseconds. Passing numbers
+    # returns 400 "json: cannot unmarshal number into Go struct field
+    # GetServicesParams.start of type string" — confirmed live, do not
+    # rediscover it.
+    start_ms = _parse_time_ms(start)
+    end_ms = _parse_time_ms(end)
+    data = await client.post(
+        "/api/v1/services",
+        {
+            "start": str(start_ms * 1_000_000),
+            "end": str(end_ms * 1_000_000),
+            "tags": [],
+        },
+    )
+    if not isinstance(data, list):
+        return []
+    return [
+        {k: svc[k] for k in _SERVICE_FIELDS if k in svc} for svc in data if isinstance(svc, dict)
+    ]
 
 
 @tool

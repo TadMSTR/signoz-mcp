@@ -195,16 +195,126 @@ def _v5_trace(rows: list[dict]) -> dict:
 # ── list_services ─────────────────────────────────────────────────────────────
 
 
+# vikunja#322. The version of this test that shipped with the defect mocked
+# GET /api/v1/services/list and asserted the two names came back — it passed
+# against the broken implementation and could not have failed for the reason the
+# tool was wrong. Retargeted onto the replacement rather than deleted; the
+# coverage it represented is real, it was just pointed at the wrong endpoint.
+#
+# These are CONTRACT tests. They cannot prove the result is COMPLETE, because a
+# mock returns whatever it is told to — that claim is only testable against a
+# live backend, which is what tests/test_live_signoz.py does. What they can and
+# do pin is the three things that were wrong or would silently break again:
+# the endpoint, the HTTP verb, and the nanoseconds-as-strings encoding.
+
+_SERVICES_FIXTURE = [
+    {
+        "serviceName": "frontend",
+        "p99": 1093332.1,
+        "avgDuration": 653861.35,
+        "numCalls": 14,
+        "callRate": 2.3e-05,
+        "numErrors": 0,
+        "errorRate": 0.0,
+        "num4XX": 0,
+        "fourXXRate": 0.0,
+        "dataWarning": {"topLevelOps": ["overflow_operation", "GET /"]},
+    },
+    {
+        "serviceName": "backend",
+        "p99": 19356.26,
+        "avgDuration": 12242.5,
+        "numCalls": 4,
+        "callRate": 6.6e-06,
+        "numErrors": 1,
+        "errorRate": 0.25,
+        "num4XX": 0,
+        "fourXXRate": 0.0,
+        "dataWarning": {"topLevelOps": ["overflow_operation"]},
+    },
+]
+
+
 @pytest.mark.asyncio
 @respx.mock
-async def test_list_services_returns_list():
-    respx.get("http://localhost:8080/api/v1/services/list").mock(
+async def test_list_services_uses_the_time_bounded_post_endpoint():
+    """The defect itself: the old GET has no time range and under-reports."""
+    old_route = respx.get("http://localhost:8080/api/v1/services/list").mock(
         return_value=Response(200, json=["frontend", "backend"])
+    )
+    new_route = respx.post("http://localhost:8080/api/v1/services").mock(
+        return_value=Response(200, json=_SERVICES_FIXTURE)
     )
     from signoz_mcp.server import list_services
 
-    result = await list_services()
-    assert result == ["frontend", "backend"]
+    result = await list_services(start="-24h")
+
+    assert new_route.called, "list_services must POST /api/v1/services"
+    assert not old_route.called, (
+        "list_services still calls GET /api/v1/services/list, which takes no time "
+        "range and returned 16 of 25 services on forge (vikunja#322)"
+    )
+    assert [s["serviceName"] for s in result] == ["frontend", "backend"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_services_sends_nanoseconds_as_json_strings():
+    """Numbers here return 400 from SigNoz. Confirmed live 2026-09-20."""
+    route = respx.post("http://localhost:8080/api/v1/services").mock(
+        return_value=Response(200, json=_SERVICES_FIXTURE)
+    )
+    from signoz_mcp.server import list_services
+
+    await list_services(start="-24h", end="now")
+
+    body = json.loads(route.calls[0].request.content)
+    assert isinstance(body["start"], str), (
+        "start must be a JSON STRING of nanoseconds — a number returns 400 "
+        "'cannot unmarshal number into Go struct field GetServicesParams.start'"
+    )
+    assert isinstance(body["end"], str), "end must be a JSON string of nanoseconds"
+    # Nanoseconds, not milliseconds: a 24h window is 8.64e13 ns apart.
+    span_ns = int(body["end"]) - int(body["start"])
+    assert abs(span_ns - 24 * 3600 * 1_000_000_000) < 5_000_000_000, (
+        f"window is {span_ns} ns apart; a -24h request should be ~8.64e13 ns. "
+        "A millisecond value here silently queries a 24-second window."
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_services_returns_red_metrics_and_drops_datawarning():
+    respx.post("http://localhost:8080/api/v1/services").mock(
+        return_value=Response(200, json=_SERVICES_FIXTURE)
+    )
+    from signoz_mcp.server import list_services
+
+    result = await list_services(start="-24h")
+
+    assert result[1] == {
+        "serviceName": "backend",
+        "p99": 19356.26,
+        "avgDuration": 12242.5,
+        "numCalls": 4,
+        "callRate": 6.6e-06,
+        "numErrors": 1,
+        "errorRate": 0.25,
+        "num4XX": 0,
+        "fourXXRate": 0.0,
+    }
+    assert all("dataWarning" not in s for s in result)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_services_tolerates_a_non_list_body():
+    respx.post("http://localhost:8080/api/v1/services").mock(
+        return_value=Response(200, json={"error": None})
+    )
+    from signoz_mcp.server import list_services
+
+    assert await list_services(start="-24h") == []
 
 
 # ── search_traces ─────────────────────────────────────────────────────────────
@@ -822,6 +932,84 @@ async def test_timeout_raises_timeout_error():
 
     with pytest.raises(TimeoutError):
         await get_health()
+
+
+# ── _client.post() — the helper added for vikunja#322 ─────────────────────────
+#
+# `query()` is hardcoded to the query_range URL and `get()` cannot carry a body, so
+# #322's fix needed a third entry point. It must hold the SAME contract as the other
+# two: sanitized errors, and the API key never in an exception. Tested here rather
+# than assumed, because it is the newest path to the backend and the one a future
+# tool is most likely to reuse.
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_post_raises_timeout_error():
+    import httpx as _httpx
+
+    respx.post("http://localhost:8080/api/v1/services").mock(
+        side_effect=_httpx.TimeoutException("timeout")
+    )
+    from signoz_mcp.server import list_services
+
+    with pytest.raises(TimeoutError):
+        await list_services(start="-24h")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_post_raises_connection_error():
+    import httpx as _httpx
+
+    respx.post("http://localhost:8080/api/v1/services").mock(
+        side_effect=_httpx.ConnectError("refused")
+    )
+    from signoz_mcp.server import list_services
+
+    with pytest.raises(ConnectionError):
+        await list_services(start="-24h")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_post_401_does_not_leak_the_api_key():
+    respx.post("http://localhost:8080/api/v1/services").mock(
+        return_value=Response(401, json={"error": "unauthorized"})
+    )
+    from signoz_mcp.server import list_services
+
+    with pytest.raises(ValueError) as exc_info:
+        await list_services(start="-24h")
+    message = str(exc_info.value)
+    assert "SIGNOZ_API_KEY missing or invalid" in message
+    assert "test-api-key" not in message, "the API key value must never reach an exception"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_post_surfaces_signoz_error_text():
+    """The 400 that the nanoseconds-as-numbers bug produced is this path."""
+    respx.post("http://localhost:8080/api/v1/services").mock(
+        return_value=Response(
+            400,
+            json={
+                "error": {
+                    "code": 400,
+                    "message": (
+                        "json: cannot unmarshal number into Go struct field "
+                        "GetServicesParams.start of type string"
+                    ),
+                }
+            },
+        )
+    )
+    from signoz_mcp.server import list_services
+
+    with pytest.raises(ValueError) as exc_info:
+        await list_services(start="-24h")
+    assert "cannot unmarshal number" in str(exc_info.value)
+    assert "test-api-key" not in str(exc_info.value)
 
 
 # ── _client payload shape ─────────────────────────────────────────────────────

@@ -69,6 +69,13 @@ include = ["signoz_mcp*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    # Integration tests that need a real SigNoz backend (tests/test_live_signoz.py).
+    # They skip unless SIGNOZ_LIVE=1. Registered here so the skip is a deliberate,
+    # named state rather than an unknown-marker warning — a SKIP is not a PASS, and
+    # these are the only tests that can catch an INCOMPLETE result (vikunja#322).
+    "live: requires a reachable SigNoz instance; opt in with SIGNOZ_LIVE=1",
+]
 
 [tool.ruff]
 line-length = 100

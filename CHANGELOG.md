@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`list_services` returned an incomplete set (vikunja#322).** It called
+  `GET /api/v1/services/list`, which takes **no time range** and applies its own short
+  implicit window. Measured live against SigNoz v0.118.0 on 2026-09-20: that endpoint
+  returned **16** services regardless of the window requested, while
+  `POST /api/v1/services` with an explicit window returned **21 at 24h and 25 at 7d** —
+  set-identical to `aggregate_traces(count, group_by="service.name")` at both. Nine
+  services were missing over seven days, including `scoped-mcp-doc-health`,
+  `memsearch-summarize` and `nats-mcp`.
+
+  This was a silently-wrong answer, not an error: every caller got a plausible list.
+
+### Changed
+
+- **`list_services` is now time-bounded and returns dicts.** New `start`/`end` parameters
+  (defaults `-1h`/`now`), for parity with `search_traces`, `aggregate_traces` and
+  `list_metrics`. The return type changes from `list[str]` to `list[dict]` carrying
+  SigNoz's own field names — `serviceName`, `p99`, `avgDuration`, `numCalls`, `callRate`,
+  `numErrors`, `errorRate`, `num4XX`, `fourXXRate`. **This is a breaking change for
+  callers that treated the result as a list of strings.**
+
+  `p99`/`avgDuration` are nanoseconds, verified against `p99(duration_nano)` from the
+  trace aggregate. They are computed over each service's TOP-LEVEL operations, so they
+  do not match the trace aggregate exactly — within ~7% for most services on forge,
+  diverging up to 2x where span trees are deep. The docstring says so; use
+  `aggregate_traces` when you need all spans. `dataWarning` is dropped (its only member
+  is `topLevelOps`, which includes SigNoz's synthetic `overflow_operation` entry).
+
+- **`_client.post(path, json_body)`** — `query()` is hardcoded to the query_range URL
+  and `get()` cannot carry a body, so the fix needed a third entry point. It reuses
+  `_check_response`, so the sanitized-error and never-leak-the-key contract holds
+  identically; that is asserted in tests rather than assumed.
+
+  `start`/`end` on this endpoint must be **JSON strings of nanoseconds**. Numbers return
+  `400 json: cannot unmarshal number into Go struct field GetServicesParams.start of
+  type string`.
+
+### Testing
+
+- **`tests/test_live_signoz.py`** — integration tests against a real SigNoz. Three of
+  this repo's shipped defects were invisible to its 845-line suite *because that suite
+  mocks the API*, and no mocked test can assert a result is COMPLETE. The #322
+  regression test asserts **set equality against `aggregate_traces`**, not a row count:
+  a count assertion passes on the broken version whenever the counts coincide.
+
+  These skip unless `SIGNOZ_LIVE=1`. **A skip is not a pass** — the marker is registered
+  in `pyproject.toml` so the state is named rather than silent.
+
+- The pre-existing `test_list_services_returns_list` mocked the *broken* endpoint and
+  passed against the defect. **Retargeted onto the replacement rather than deleted** —
+  the coverage was real, it was pointed at the wrong endpoint. All four replacement
+  tests were confirmed RED against the shipped implementation in an isolated venv before
+  the fix landed (an editable install makes a worktree copy insufficient to prove this).
+
 ### Repo standard — Baseline under corrected attributes
 
 `repo-index.md` declared `publishes: none, deployed: true` and said nothing about
