@@ -1155,3 +1155,217 @@ async def test_client_omits_variables_field():
     await search_traces(service="svc")
     payload = json.loads(captured[0])
     assert "variables" not in payload, "'variables' field was removed in v5"
+
+
+# ── Fleet-operator surface ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_builder_query_passes_the_spec_through():
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=_v5_scalar(["service.name", "__result_0"], [["a", 1]]))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import execute_builder_query
+
+    body = await execute_builder_query(
+        signal="traces",
+        request_type="scalar",
+        start="-24h",
+        spec={
+            "aggregations": [{"expression": "count()"}],
+            "groupBy": [{"name": "service.name"}],
+            "limit": 7,
+        },
+    )
+
+    spec = captured[0]["compositeQuery"]["queries"][0]["spec"]
+    assert spec["aggregations"] == [{"expression": "count()"}]
+    assert spec["groupBy"] == [{"name": "service.name"}]
+    assert spec["limit"] == 7
+    # The raw body is returned unparsed — that is what makes it a passthrough
+    # rather than a second wrapper.
+    assert body["data"]["data"]["results"][0]["columns"] == [
+        {"name": "service.name"},
+        {"name": "__result_0"},
+    ]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_builder_query_still_validates_the_filter_expression():
+    """An escape hatch from the TOOL SHAPES, not from input validation."""
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_scalar([], []))
+    )
+    from signoz_mcp.server import execute_builder_query
+
+    with pytest.raises(ValueError, match="Invalid filter expression"):
+        await execute_builder_query(
+            signal="traces",
+            request_type="scalar",
+            spec={"filter": {"expression": "service.name = `backtick`"}},
+        )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_builder_query_cannot_override_the_envelope():
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=_v5_scalar([], []))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import execute_builder_query
+
+    await execute_builder_query(
+        signal="traces",
+        request_type="scalar",
+        spec={"name": "Z", "signal": "logs", "disabled": True, "limit": 1},
+    )
+
+    spec = captured[0]["compositeQuery"]["queries"][0]["spec"]
+    assert spec["name"] == "A", "caller must not rename the query"
+    assert spec["signal"] == "traces", "caller must not redirect the signal via spec"
+    assert spec["disabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_builder_query_rejects_a_bad_signal():
+    from signoz_mcp.server import execute_builder_query
+
+    with pytest.raises(ValueError):
+        await execute_builder_query(signal="profiles", request_type="scalar", spec={})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fleet_health_shapes_three_aggregations_into_one_row():
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(
+            200,
+            json=_v5_scalar(
+                ["service.name", "__result_0", "__result_1", "__result_2"],
+                [
+                    ["busy", 1000, 2_500_000.0, 25],
+                    ["quiet", 10, 500_000.0, 0],
+                ],
+            ),
+        )
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import fleet_health
+
+    rows = await fleet_health(start="-24h")
+
+    # ONE request, so every column comes from the same scan over the same spans.
+    assert len(captured) == 1, "fleet_health must not fan out into several queries"
+    spec = captured[0]["compositeQuery"]["queries"][0]["spec"]
+    assert [a["expression"] for a in spec["aggregations"]] == [
+        "count()",
+        "p95(duration_nano)",
+        "countIf(has_error = true)",
+    ]
+
+    assert rows[0] == {
+        "service": "busy",
+        "calls": 1000,
+        "errors": 25,
+        "error_rate": 0.025,
+        "p95_nano": 2_500_000.0,
+        "p95_ms": 2.5,
+    }
+    assert rows[1]["error_rate"] == 0.0
+    assert [r["service"] for r in rows] == ["busy", "quiet"], "busiest first"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fleet_health_does_not_divide_by_zero():
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(
+            200,
+            json=_v5_scalar(
+                ["service.name", "__result_0", "__result_1", "__result_2"],
+                [["ghost", 0, 0, 0]],
+            ),
+        )
+    )
+    from signoz_mcp.server import fleet_health
+
+    assert (await fleet_health())[0]["error_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compare_windows_computes_deltas_across_two_queries():
+    bodies = [
+        _v5_scalar(["service.name", "__result_0"], [["steady", 100], ["gone", 50]]),
+        _v5_scalar(["service.name", "__result_0"], [["steady", 150], ["new", 20]]),
+    ]
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=bodies[len(captured) - 1])
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import compare_windows
+
+    rows = await compare_windows(window_a="-48h", window_b="-24h")
+    by_service = {r["service.name"]: r for r in rows}
+
+    assert by_service["steady"]["delta"] == 50
+    assert by_service["steady"]["pct_change"] == 50.0
+
+    # A group that VANISHED is the interesting row, not one to drop for a tidy join.
+    assert by_service["gone"]["after"] == 0
+    assert by_service["gone"]["delta"] == -50
+
+    # A NEW group has no percentage change. Reporting 0 or infinity would be a
+    # fabricated number, so it is None.
+    assert by_service["new"]["before"] == 0
+    assert by_service["new"]["pct_change"] is None
+
+    assert [abs(r["delta"]) for r in rows] == sorted(
+        (abs(r["delta"]) for r in rows), reverse=True
+    ), "largest absolute change first"
+
+    # The baseline window ends where the recent window begins.
+    assert captured[0]["end"] == captured[1]["start"]
+
+
+@pytest.mark.asyncio
+async def test_compare_windows_rejects_reversed_windows():
+    from signoz_mcp.server import compare_windows
+
+    with pytest.raises(ValueError, match="must be earlier than"):
+        await compare_windows(window_a="-24h", window_b="-48h")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compare_windows_groups_by_span_name_without_new_code():
+    """Plan item 4: per-span-name is already reachable through group_by."""
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=_v5_scalar(["service.name", "name", "__result_0"], []))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import compare_windows
+
+    await compare_windows(window_a="-48h", window_b="-24h", group_by="service.name,name")
+
+    spec = captured[0]["compositeQuery"]["queries"][0]["spec"]
+    assert spec["groupBy"] == [{"name": "service.name"}, {"name": "name"}]

@@ -18,6 +18,11 @@ Tools:
   list_alert_rules   — Alert rules + firing state
   get_health         — Connectivity check
 
+Fleet-operator surface:
+  execute_builder_query — Raw Query Builder v5 passthrough (the escape hatch)
+  fleet_health          — Per-service calls / error rate / p95, in one query
+  compare_windows       — Per-group delta between two windows
+
 Configuration:
   SIGNOZ_URL              — SigNoz base URL (default: http://localhost:8080)
   SIGNOZ_API_KEY          — Service Account token (required)
@@ -1156,6 +1161,230 @@ _TOOL_NAMES = (
     "list_alert_rules",
     "get_health",
 )
+
+
+# ── Fleet-operator surface ────────────────────────────────────────────────────
+
+
+def _scalar_results(body: dict) -> list[dict]:
+    """Parse a multi-aggregation scalar response into dicts keyed by column name."""
+    return _parse_scalar_rows(body)
+
+
+@tool
+async def execute_builder_query(
+    signal: str,
+    request_type: str,
+    spec: dict,
+    start: str = "-1h",
+    end: str = "now",
+) -> dict:
+    """Run a raw SigNoz Query Builder v5 spec. The escape hatch.
+
+    Every other tool here is a wrapper, and vikunja#322 is what a wrong wrapper
+    costs: `list_services` called an endpoint that silently under-reported, and
+    callers had no way through. This is the way through — if a tool's shape is
+    wrong for your question, build the spec yourself rather than working around it.
+
+    Args:
+        signal:       'traces', 'logs' or 'metrics'.
+        request_type: 'scalar' or 'time_series'.
+        spec:         The builder_query spec body — `aggregations`, `groupBy`,
+                      `filter`, `order`, `limit`, `offset`. `name`, `signal` and
+                      `disabled` are supplied for you.
+        start/end:    Window, e.g. '-24h' / 'now'.
+
+    Returns:
+        The parsed SigNoz response body, unmodified. Parsing it is the caller's
+        job — that is the point of a passthrough. `_parse_scalar_rows`-shaped
+        output is available from `aggregate_traces` if you want it done for you.
+
+    Example — reproduce the 7d service list from first principles:
+        execute_builder_query(
+            signal="traces", request_type="scalar", start="-168h",
+            spec={"aggregations": [{"expression": "count()"}],
+                  "groupBy": [{"name": "service.name"}], "limit": 1000},
+        )
+    """
+    sig = _validate_signal(signal)
+    req_type = request_type.lower()
+    if req_type not in _ALLOWED_REQUEST_TYPES:
+        raise ValueError(f"request_type must be one of {sorted(_ALLOWED_REQUEST_TYPES)}")
+    if not isinstance(spec, dict):
+        raise ValueError("spec must be a dict")
+
+    # The allowlist still applies to any caller-supplied filter expression. A
+    # passthrough is an escape hatch from this server's TOOL SHAPES, not from its
+    # input validation — that distinction is the whole reason this is safe to add.
+    safe_spec = dict(spec)
+    filt = safe_spec.get("filter")
+    if isinstance(filt, dict) and isinstance(filt.get("expression"), str):
+        safe_spec["filter"] = {**filt, "expression": _validate_filter_expr(filt["expression"])}
+    elif isinstance(filt, str):
+        safe_spec["filter"] = {"expression": _validate_filter_expr(filt)}
+
+    # These are set by _build_query_payload; a caller overriding them would be
+    # reaching past the passthrough into the envelope.
+    for reserved in ("name", "signal", "disabled"):
+        safe_spec.pop(reserved, None)
+
+    start_ms = _parse_time_ms(start)
+    end_ms = _parse_time_ms(end)
+    return await client.query(sig, req_type, safe_spec, start_ms, end_ms)
+
+
+@tool
+async def fleet_health(start: str = "-1h", end: str = "now", limit: int = 1000) -> list[dict]:
+    """Per-service call count, error rate and p95 latency — the first question.
+
+    Composing this from aggregate_traces takes three or four calls. This is ONE,
+    which also means every column comes from the same scan over the same spans:
+    `count()`, `p95(duration_nano)` and `countIf(has_error = true)` are requested
+    as three aggregations on a single query.
+
+    That consistency is deliberate. `list_services` also returns per-service RED
+    metrics, but its `p99`/`avgDuration` cover each service's TOP-LEVEL operations
+    only — mixing the two sources would put two different scopes in adjacent
+    columns of the same row.
+
+    Args:
+        start/end: Window, e.g. '-24h' / 'now'.
+        limit:     Max services (max 10000).
+
+    Returns:
+        One dict per service, busiest first:
+        `service`, `calls`, `errors`, `error_rate` (0.0-1.0, `errors/calls`),
+        `p95_nano` (raw, as SigNoz returns it) and `p95_ms` (the same value / 1e6,
+        rounded to 3dp — a stated derivation, not a separate measurement).
+    """
+    start_ms = _parse_time_ms(start)
+    end_ms = _parse_time_ms(end)
+    spec = {
+        "aggregations": [
+            {"expression": "count()"},
+            {"expression": "p95(duration_nano)"},
+            {"expression": "countIf(has_error = true)"},
+        ],
+        "groupBy": _build_group_by("service.name"),
+        "order": [{"key": {"name": "count()"}, "direction": "desc"}],
+        "limit": min(max(limit, 1), _MAX_LIMIT_AGG),
+    }
+    body = await client.query("traces", "scalar", spec, start_ms, end_ms)
+
+    rows: list[dict] = []
+    for row in _scalar_results(body):
+        service = row.get("service.name")
+        if not service:
+            continue
+        calls = row.get("__result_0") or 0
+        p95_nano = row.get("__result_1") or 0
+        errors = row.get("__result_2") or 0
+        rows.append(
+            {
+                "service": service,
+                "calls": calls,
+                "errors": errors,
+                # Guarded rather than assumed non-zero: a group can only exist if it
+                # has spans, but a future filter could make that untrue silently.
+                "error_rate": round(errors / calls, 6) if calls else 0.0,
+                "p95_nano": p95_nano,
+                "p95_ms": round(p95_nano / 1_000_000, 3),
+            }
+        )
+    rows.sort(key=lambda r: -r["calls"])
+    return rows
+
+
+@tool
+async def compare_windows(
+    window_a: str,
+    window_b: str,
+    aggregation: str = "count",
+    aggregate_on: str = "",
+    group_by: str = "service.name",
+    filter: str = "",
+    limit: int = 1000,
+) -> list[dict]:
+    """Per-group delta between two time windows — "what changed since the deploy".
+
+    A raw count is a stock, not a flow. The operator question is almost never "how
+    many errors are there" but "are there more than before", and answering that by
+    eye from two separate tool calls is where the mistake gets made.
+
+    Args:
+        window_a:     The EARLIER/baseline window, e.g. '-48h'. Runs from
+                      window_a to window_b.
+        window_b:     The boundary between the two windows, e.g. '-24h'. The
+                      recent window runs from window_b to now.
+        aggregation:  count, count_distinct, avg, sum, min, max, p50-p99, rate.
+        aggregate_on: Field to aggregate (required unless count/rate).
+        group_by:     Comma-separated fields. Defaults to 'service.name'; use
+                      'name' for per-span-name, or 'service.name,name' for both.
+        filter:       Free-form filter expression applied to BOTH windows.
+        limit:        Max groups per window.
+
+    Returns:
+        One dict per group, largest absolute change first:
+        `<group field(s)>`, `before`, `after`, `delta` (after - before), and
+        `pct_change` (None when `before` is 0 — a new group has no percentage
+        change, and reporting one as 0 or infinity would be a fabricated number).
+
+        Groups present in only one window ARE included, with 0 for the side they
+        are missing from. Those are usually the interesting rows — a service that
+        stopped reporting is exactly what this is for — and dropping them to make
+        the join tidy would hide the finding.
+    """
+    agg_expr = _build_agg_expression(aggregation, aggregate_on)
+    group_keys = _build_group_by(group_by)
+    if not group_keys:
+        raise ValueError("group_by must name at least one field")
+    group_names = [k["name"] for k in group_keys]
+    limit = min(max(limit, 1), _MAX_LIMIT_AGG)
+
+    spec: dict = {
+        "aggregations": [{"expression": agg_expr}],
+        "groupBy": group_keys,
+        "order": _build_order("", agg_expr),
+        "limit": limit,
+    }
+    if filter:
+        spec["filter"] = {"expression": _validate_filter_expr(filter)}
+
+    a_start, a_end = _parse_time_ms(window_a), _parse_time_ms(window_b)
+    b_start, b_end = _parse_time_ms(window_b), _parse_time_ms("now")
+    if a_start >= a_end:
+        raise ValueError(
+            f"window_a ({window_a}) must be earlier than window_b ({window_b}) — "
+            "the baseline window runs from window_a to window_b"
+        )
+
+    before_body = await client.query("traces", "scalar", spec, a_start, a_end)
+    after_body = await client.query("traces", "scalar", spec, b_start, b_end)
+
+    def keyed(body: dict) -> dict[tuple, float]:
+        out: dict[tuple, float] = {}
+        for row in _scalar_results(body):
+            key = tuple(row.get(n) for n in group_names)
+            if any(k is None for k in key):
+                continue
+            out[key] = row.get("__result_0") or 0
+        return out
+
+    before, after = keyed(before_body), keyed(after_body)
+
+    rows: list[dict] = []
+    for key in before.keys() | after.keys():
+        b = before.get(key, 0)
+        a = after.get(key, 0)
+        row = dict(zip(group_names, key, strict=False))
+        row["before"] = b
+        row["after"] = a
+        row["delta"] = a - b
+        row["pct_change"] = round((a - b) / b * 100, 2) if b else None
+        rows.append(row)
+
+    rows.sort(key=lambda r: -abs(r["delta"]))
+    return rows
 
 
 def main() -> None:

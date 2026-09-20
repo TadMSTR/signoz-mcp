@@ -139,3 +139,75 @@ async def test_tail_logs_takes_no_service_argument(server):
         "prove that against real log data and update this test; vikunja#927 was this "
         "parameter being validated and then silently dropped from the filter."
     )
+
+
+# ── Fleet-operator surface ────────────────────────────────────────────────────
+
+
+@requires_live
+@pytest.mark.asyncio
+async def test_execute_builder_query_is_a_real_escape_hatch(server):
+    """A hand-built spec must reproduce what the wrapper returns.
+
+    If it cannot, it is a second wrapper rather than a way past the first — and
+    vikunja#322 is precisely the case where a wrong wrapper left callers stuck.
+    """
+    body = await server.execute_builder_query(
+        signal="traces",
+        request_type="scalar",
+        start="-168h",
+        spec={
+            "aggregations": [{"expression": "count()"}],
+            "groupBy": [{"name": "service.name"}],
+            "limit": 1000,
+        },
+    )
+    hand = set()
+    for result in body.get("data", {}).get("data", {}).get("results", []) or []:
+        cols = [c.get("name") for c in result.get("columns") or []]
+        for row in result.get("data") or []:
+            parsed = dict(zip(cols, row, strict=False)) if isinstance(row, list) else row
+            if parsed.get("service.name"):
+                hand.add(parsed["service.name"])
+
+    agg = await server.aggregate_traces(
+        aggregation="count", group_by="service.name", start="-168h", limit=1000
+    )
+    wrapped = {r["service.name"] for r in agg if r.get("service.name")}
+
+    assert hand == wrapped, f"passthrough and wrapper disagree: {hand ^ wrapped}"
+    assert hand, "no services — is SigNoz receiving traces?"
+
+
+@requires_live
+@pytest.mark.asyncio
+async def test_fleet_health_agrees_with_an_independent_aggregate(server):
+    """Cross-checked against a separate query, not just asserted to be well-formed."""
+    health = await server.fleet_health(start="-168h")
+    agg = await server.aggregate_traces(
+        aggregation="count", group_by="service.name", start="-168h", limit=1000
+    )
+    counts = {r["service.name"]: r["__result_0"] for r in agg if r.get("service.name")}
+
+    assert {r["service"] for r in health} == set(counts)
+    for row in health:
+        assert row["calls"] == counts[row["service"]], (
+            f"{row['service']}: fleet_health says {row['calls']} calls, "
+            f"aggregate_traces says {counts[row['service']]}"
+        )
+        assert 0.0 <= row["error_rate"] <= 1.0
+        assert row["p95_ms"] == round(row["p95_nano"] / 1_000_000, 3)
+
+
+@requires_live
+@pytest.mark.asyncio
+async def test_compare_windows_deltas_are_internally_consistent(server):
+    rows = await server.compare_windows(window_a="-48h", window_b="-24h")
+    assert rows, "no groups over the last 48h"
+    for r in rows:
+        assert r["delta"] == r["after"] - r["before"]
+        if r["before"] == 0:
+            assert r["pct_change"] is None, (
+                "a group with no baseline has no percentage change; reporting one "
+                "would be a fabricated number"
+            )

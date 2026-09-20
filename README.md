@@ -25,6 +25,14 @@ Targets the SigNoz **v5** query API (v0.118+).
 | `list_alert_rules` | Alert rules and current firing state |
 | `get_health` | Connectivity check |
 
+### Fleet-operator surface
+
+| Tool | Description |
+|------|-------------|
+| `execute_builder_query` | Raw SigNoz Query Builder v5 passthrough — the escape hatch when a wrapper's shape is wrong for your question |
+| `fleet_health` | Per-service `calls`, `errors`, `error_rate`, `p95_nano`/`p95_ms` — **one** query, so every column comes from the same scan |
+| `compare_windows` | Per-group delta between two windows — `before`, `after`, `delta`, `pct_change`. Answers "what changed since the deploy" |
+
 All tools are read-only — the server never exposes SigNoz write endpoints.
 
 ## Configuration
@@ -95,3 +103,21 @@ then filtered on severity alone (vikunja#927). Which key names a service in the 
 signal is still unresolved — `search_logs` emits `service.name`, `aggregate_logs`'
 docstring recommends `resource.service.name` — and it cannot be settled until there is
 log data to test against. Trace-side tools are unaffected.
+
+## Per-tool latency, without a new tool
+
+Agents on forge emit `tool.<name>` spans, and per-tool latency is usually the actionable
+unit rather than per-service. `group_by` already reaches it — no separate tool:
+
+```python
+# Which tool calls are slowest, across the fleet?
+aggregate_traces(aggregation="p95", aggregate_on="duration_nano",
+                 group_by="service.name,name", start="-168h")
+
+# Did a specific tool get slower since yesterday?
+compare_windows(window_a="-48h", window_b="-24h",
+                aggregation="p95", aggregate_on="duration_nano",
+                group_by="name", filter="service.name = 'scoped-mcp-developer'")
+```
+
+`name` is the span name; `service.name,name` groups by both.

@@ -2,6 +2,46 @@
 
 ## [Unreleased]
 
+### Added — the fleet-operator surface
+
+Three tools an operator running ~25 instrumented services wants and the upstream SigNoz
+MCP server does not provide. All trace-side, so none is blocked on #926.
+
+- **`execute_builder_query(signal, request_type, spec, start, end)`** — a thin
+  passthrough to Query Builder v5, returning SigNoz's body unparsed. Every other tool
+  here is a wrapper, and #322 is what a wrong wrapper costs: callers had no way through.
+  Verified live to reproduce `aggregate_traces`' 7d result from a hand-built spec — set
+  equality, not a plausible-looking answer.
+
+  It is an escape hatch from this server's **tool shapes, not its input validation**: a
+  caller-supplied `filter` expression still goes through `_validate_filter_expr`, and
+  `name`/`signal`/`disabled` cannot be overridden from `spec` to reach past the envelope.
+  Both are asserted in tests.
+
+- **`fleet_health(start, end)`** — per-service `calls`, `errors`, `error_rate`,
+  `p95_nano` and `p95_ms`, busiest first. Composing this from `aggregate_traces` takes
+  three or four calls; this is **one**, because SigNoz v5 accepts several aggregations on
+  a single query (`count()`, `p95(duration_nano)`, `countIf(has_error = true)`).
+
+  One call also means every column comes from the same scan over the same spans. That is
+  deliberate: `list_services` returns RED metrics too, but its `p99`/`avgDuration` cover
+  top-level operations only, and merging the two sources would put two different scopes
+  in adjacent columns of one row. Cross-checked live against an independent
+  `aggregate_traces` — call counts match for all 25 services.
+
+- **`compare_windows(window_a, window_b, ...)`** — per-group `before`/`after`/`delta`/
+  `pct_change`. A raw count is a stock, not a flow; the operator question is almost
+  always the delta.
+
+  Groups present in only one window are **kept**, with 0 on the missing side — a service
+  that stopped reporting is exactly what this is for, and dropping it for a tidy join
+  would hide the finding. `pct_change` is `None` when `before` is 0, because a new group
+  has no percentage change and reporting 0 or infinity would be a fabricated number.
+
+- **Per-span-name grouping needed no new code**, which was checked before writing any:
+  `group_by="name"` and `group_by="service.name,name"` already work. Documented in the
+  README with two worked examples, both run against live SigNoz before being committed.
+
 ### Fixed
 
 - **`list_services` returned an incomplete set (vikunja#322).** It called

@@ -8,7 +8,7 @@ last-updated: 2026-07-19
 
 ## Purpose
 
-FastMCP Python MCP server wrapping the SigNoz HTTP API with 13 read-only tools.
+FastMCP Python MCP server wrapping the SigNoz HTTP API with 16 read-only tools.
 Gives agents direct access to SigNoz observability data — services, traces, logs,
 metrics, and alert rules — without a Grafana session or inline HTTP calls.
 Targets the SigNoz v5 query API (v0.118+). Deployed on forge as a PM2 process wired
@@ -29,6 +29,7 @@ src/signoz_mcp/
     audit_log.py  Read-only audit-log before-hook (who/what/args-hash)
 tests/
   test_server.py       tool + helper tests (respx-mocked)
+  test_live_signoz.py  integration tests against a REAL SigNoz (opt in: SIGNOZ_LIVE=1)
   test_hooks.py        hook registry + instrument wiring
   test_telemetry.py    telemetry disabled-path + _emit fan-out
   test_contrib_audit.py audit-log hook
@@ -40,12 +41,24 @@ pyproject.toml        Package metadata, deps, ruff + pytest config
 
 ## Invariants
 
-- All MCP tools are read-only — no POST/PUT/DELETE to SigNoz write endpoints.
+- All MCP tools are read-only. **Read-only is about the EFFECT, not the HTTP verb** —
+  SigNoz's query API is POST-based, and `list_services` reads via
+  `POST /api/v1/services` because that is the only form that accepts a time range
+  (vikunja#322). The invariant is: no call may create, modify or delete anything in
+  SigNoz. No writes to alerts, dashboards, views or notification channels. (This
+  wording previously said "no POST/PUT/DELETE", which would have forbidden the fix
+  for #322 and was already untrue of every query_range call in the file.)
 - `SIGNOZ_API_KEY` value must never appear in any log output, error message, or exception traceback.
 - `SIGNOZ_API_KEY` is sourced from environment only — no config file or `.env` fallback.
 - `SIGNOZ_QUERY_VERSION` must be validated against allowlist `["v5"]` at startup.
 - `service` parameters and free-form `filter` expressions are validated against
-  allowlists before use (see `_validate_service` / `_validate_filter_expr`).
+  allowlists before use (see `_validate_service` / `_validate_filter_expr`). This holds
+  for `execute_builder_query` too: it is an escape hatch from this server's TOOL SHAPES,
+  not from its input validation.
+- **A parameter that is validated must also be USED.** Validating an argument and then
+  dropping it from the query is vikunja#927 — it reads as rigour and produces a silently
+  wrong answer. If a parameter cannot be honoured, remove it from the signature rather
+  than documenting why it is ignored.
 - Response sizes are capped before returning to the MCP caller.
 - No shell exec, subprocess calls, or filesystem writes.
 - The telemetry layer must import and run with **zero** optional deps installed
