@@ -164,9 +164,11 @@ finding, not a regression.
   because PEP 751 allows `pylock.<name>.toml` and a shared directory makes `pip-audit
   --locked` silently **merge** them (measured here: 89 runtime + 84 dev → 99 merged),
   losing the runtime-vs-dev distinction the split exists to draw.
-- **Coverage floor ratcheted 80 → 86** (F8) with its measured number and date in a
+- **Coverage floor ratcheted 80 → 87** (F8) with its measured number and date in a
   comment beside it. The old floor sat six points below real coverage, so the gate
-  would not have gone red on a six-point regression (vikunja#680).
+  would not have gone red on a six-point regression (vikunja#680). Worth recording the
+  intermediate step: after the #322 fix landed, coverage fell to 85.88% and the gate
+  went **red**. The response was to test the new code, not to lower the floor.
 
 Each new gate was verified **two-sided** before landing — proven to fail on a planted
 violation as well as pass on the clean tree:

@@ -97,13 +97,17 @@ omit = [
 # RATCHETED COVERAGE FLOOR — F8, and Gate Honesty's "do not shave it to make a red
 # build green".
 #
-# Measured 2026-09-20 on the src/ layout: 86.18% (579 statements, 80 missed).
-# Floor raised 80 -> 86. The previous 80 sat six points below reality, which means the
-# gate would have permitted a six-point regression without going red. Cite vikunja#680:
-# searxng-mcp's floor sat at 72/65/74/74 for ten releases while real coverage climbed
-# twelve points, and the gate silently allowed a twelve-point drop that whole time.
+# Measured 2026-09-20 at the end of build signoz-mcp-standard-defects-2026-09:
+# 87.32% (686 statements, 87 missed). Ratcheted 80 -> 86 -> 87 during that build.
 #
-# Re-measure and raise this on every bump. If it goes DOWN, that is a finding to explain
-# in the CHANGELOG, not a number to edit.
-fail_under = 86
+# The 80 it started from sat six points below reality, so the gate would have permitted
+# a six-point regression without going red. Cite vikunja#680: searxng-mcp's floor sat at
+# 72/65/74/74 for ten releases while real coverage climbed twelve points, and the gate
+# silently allowed a twelve-point drop that whole time.
+#
+# The intermediate step is worth recording: after the #322 fix landed, coverage fell to
+# 85.88% and this gate went RED. The response was to test the new code, not to lower the
+# floor. That is the rule — do not shave it to make a red build green. If it goes DOWN,
+# that is a finding to explain in the CHANGELOG, not a number to edit.
+fail_under = 87
 show_missing = true
