@@ -1369,3 +1369,61 @@ async def test_compare_windows_groups_by_span_name_without_new_code():
 
     spec = captured[0]["compositeQuery"]["queries"][0]["spec"]
     assert spec["groupBy"] == [{"name": "service.name"}, {"name": "name"}]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_builder_query_validates_every_free_form_string():
+    """Not just `filter`. An aggregation expression is the same kind of DSL string,
+    and validating one but not the other turns an escape hatch into a bypass."""
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_scalar([], []))
+    )
+    from signoz_mcp.server import execute_builder_query
+
+    with pytest.raises(ValueError, match="Invalid filter expression"):
+        await execute_builder_query(
+            signal="traces",
+            request_type="scalar",
+            spec={"aggregations": [{"expression": "count() `injected`"}]},
+        )
+
+    with pytest.raises(ValueError, match="Invalid groupBy field"):
+        await execute_builder_query(
+            signal="traces",
+            request_type="scalar",
+            spec={"groupBy": [{"name": "service.name; DROP"}]},
+        )
+
+    # order keys take the filter-expression allowlist, not the field-name one —
+    # `_build_order` puts the aggregation expression there. So the rejection message
+    # is the filter one, and `count()` must still be accepted (asserted below).
+    with pytest.raises(ValueError, match="Invalid filter expression"):
+        await execute_builder_query(
+            signal="traces",
+            request_type="scalar",
+            spec={"order": [{"key": {"name": "count() `bad`"}, "direction": "desc"}]},
+        )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_builder_query_accepts_a_well_formed_spec():
+    """The other side: validation must not reject the documented example."""
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_scalar(["service.name", "__result_0"], [["a", 1]]))
+    )
+    from signoz_mcp.server import execute_builder_query
+
+    body = await execute_builder_query(
+        signal="traces",
+        request_type="scalar",
+        start="-168h",
+        spec={
+            "aggregations": [{"expression": "count()"}],
+            "groupBy": [{"name": "service.name"}],
+            "order": [{"key": {"name": "count()"}, "direction": "desc"}],
+            "limit": 1000,
+        },
+    )
+    assert body["data"]["data"]["results"][0]["data"] == [["a", 1]]

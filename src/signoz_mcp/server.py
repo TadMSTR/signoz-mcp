@@ -1213,15 +1213,53 @@ async def execute_builder_query(
     if not isinstance(spec, dict):
         raise ValueError("spec must be a dict")
 
-    # The allowlist still applies to any caller-supplied filter expression. A
-    # passthrough is an escape hatch from this server's TOOL SHAPES, not from its
-    # input validation — that distinction is the whole reason this is safe to add.
+    # THE ALLOWLISTS STILL APPLY. A passthrough is an escape hatch from this
+    # server's TOOL SHAPES, not from its input validation — that distinction is the
+    # whole reason this is safe to add.
+    #
+    # EVERY caller-supplied free-form string gets the same treatment the wrapper
+    # tools give it, not just `filter`. `aggregations[].expression` is a DSL string
+    # exactly like `filter.expression`, and validating one but not the other would
+    # leave the asymmetry that makes an escape hatch a bypass. `aggregate_traces`
+    # builds its expression through `_build_agg_expression`'s allowlist and its
+    # group-by keys through `_validate_field_name`; a spec arriving here must not
+    # get a weaker check than the same values arriving one function over.
     safe_spec = dict(spec)
+
     filt = safe_spec.get("filter")
     if isinstance(filt, dict) and isinstance(filt.get("expression"), str):
         safe_spec["filter"] = {**filt, "expression": _validate_filter_expr(filt["expression"])}
     elif isinstance(filt, str):
         safe_spec["filter"] = {"expression": _validate_filter_expr(filt)}
+
+    aggs = safe_spec.get("aggregations")
+    if isinstance(aggs, list):
+        for agg in aggs:
+            if isinstance(agg, dict) and isinstance(agg.get("expression"), str):
+                _validate_filter_expr(agg["expression"])
+
+    # groupBy keys are plain field names, so they get the STRICTER check.
+    group_by = safe_spec.get("groupBy")
+    if isinstance(group_by, list):
+        for entry in group_by:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                _validate_field_name(entry["name"], "groupBy field")
+
+    # order keys are NOT plain field names — `_build_order` deliberately sends the
+    # aggregation expression there ({"key": {"name": "count()"}}), and fleet_health
+    # above does the same. So they get the filter-expression allowlist, which permits
+    # parens, exactly as `_build_order` does. Using `_validate_field_name` here looks
+    # tighter and would reject this tool's own documented example.
+    order = safe_spec.get("order")
+    if isinstance(order, list):
+        for entry in order:
+            if not isinstance(entry, dict):
+                continue
+            nested = entry.get("key")
+            if isinstance(nested, dict) and isinstance(nested.get("name"), str):
+                _validate_filter_expr(nested["name"])
+            elif isinstance(entry.get("name"), str):
+                _validate_filter_expr(entry["name"])
 
     # These are set by _build_query_payload; a caller overriding them would be
     # reaching past the passthrough into the envelope.

@@ -16,6 +16,14 @@ MCP server does not provide. All trace-side, so none is blocked on #926.
   It is an escape hatch from this server's **tool shapes, not its input validation**: a
   caller-supplied `filter` expression still goes through `_validate_filter_expr`, and
   `name`/`signal`/`disabled` cannot be overridden from `spec` to reach past the envelope.
+
+  Pre-audit hardening: **every** caller-supplied free-form string in `spec` is validated,
+  not just `filter`. `aggregations[].expression` is the same kind of DSL string and
+  `groupBy[].name` is a field name; validating one and not the others would leave exactly
+  the asymmetry that turns an escape hatch into a bypass. `order[].key.name` takes the
+  *filter-expression* allowlist rather than the stricter field-name one, because
+  `_build_order` deliberately puts the aggregation expression there — a test asserts
+  `count()` is still accepted, which is what caught the over-tight first attempt.
   Both are asserted in tests.
 
 - **`fleet_health(start, end)`** — per-service `calls`, `errors`, `error_rate`,
