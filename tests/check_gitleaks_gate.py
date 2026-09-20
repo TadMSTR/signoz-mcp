@@ -166,10 +166,15 @@ def main() -> int:
     version = subprocess.run(["gitleaks", "version"], capture_output=True, text=True).stdout.strip()
     print(f"gitleaks version: {version or 'unknown'}")
 
-    # Planted first. If the gate cannot fail, the clean result carries no information
-    # and there is no point reporting it as reassurance.
-    results = [check_planted_fails(), check_clean_passes()]
-    if not all(results):
+    # Planted first, and RETURN before the clean check rather than collecting both
+    # results. The list form evaluated BOTH, so a run where the planted secret went
+    # undetected still printed `ok  real tree scans clean` underneath the failure —
+    # reassurance from a gate that had just reported it cannot fail. Found by CodeRabbit
+    # on PR #13 against the identical pattern in tests/check_action_pins.py; fixed here
+    # too rather than left as a known defect in the file next door.
+    if not check_planted_fails():
+        return 1
+    if not check_clean_passes():
         return 1
     print(
         "gitleaks gate verified two-sided: it fails on a planted secret and passes "
