@@ -1427,3 +1427,76 @@ async def test_execute_builder_query_accepts_a_well_formed_spec():
         },
     )
     assert body["data"]["data"]["results"][0]["data"] == [["a", 1]]
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    "spec,match",
+    [
+        ({"having": {"expression": "count() > `x`"}}, "Invalid filter expression"),
+        (
+            {"secondaryAggregations": [{"expression": "count() `bad`"}]},
+            "Invalid filter expression",
+        ),
+        (
+            {"secondaryAggregations": [{"expression": "count()", "groupBy": [{"name": "a;b"}]}]},
+            "Invalid secondaryAggregations groupBy field",
+        ),
+        ({"selectFields": [{"name": "service name!"}]}, "Invalid selectFields field"),
+    ],
+)
+async def test_execute_builder_query_validates_the_measured_field_set(spec, match):
+    """These four were reachable and unvalidated until they were MEASURED.
+
+    Enumerating only the fields this file's wrapper tools emit gives a narrower set
+    than the v5 API accepts. Each spec below was confirmed to return 200 from live
+    SigNoz v0.118.0, i.e. it really does reach the backend — so a guard that skipped
+    it would have been a gap, not a no-op.
+    """
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_scalar([], []))
+    )
+    from signoz_mcp.server import execute_builder_query
+
+    with pytest.raises(ValueError, match=match):
+        await execute_builder_query(signal="traces", request_type="scalar", spec=spec)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_builder_query_accepts_the_measured_fields_when_well_formed():
+    """The other direction — the guard must not reject valid uses of those fields.
+
+    This is the assertion that caught the over-tight first attempt at order-key
+    validation; a validation change tested only by what it rejects cannot detect
+    over-tightening, because every negative case still passes.
+    """
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=_v5_scalar([], []))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import execute_builder_query
+
+    await execute_builder_query(
+        signal="traces",
+        request_type="scalar",
+        spec={
+            "aggregations": [{"expression": "count()"}],
+            "having": {"expression": "count() > 1"},
+            "secondaryAggregations": [
+                {"expression": "p95(duration_nano)", "groupBy": [{"name": "name"}]}
+            ],
+            "selectFields": [{"name": "service.name"}],
+            "groupBy": [{"name": "service.name"}],
+            "order": [{"key": {"name": "count()"}, "direction": "desc"}],
+        },
+    )
+
+    spec = captured[0]["compositeQuery"]["queries"][0]["spec"]
+    assert spec["having"] == {"expression": "count() > 1"}
+    assert spec["selectFields"] == [{"name": "service.name"}]
+    assert spec["secondaryAggregations"][0]["expression"] == "p95(duration_nano)"

@@ -24,6 +24,15 @@ MCP server does not provide. All trace-side, so none is blocked on #926.
   *filter-expression* allowlist rather than the stricter field-name one, because
   `_build_order` deliberately puts the aggregation expression there — a test asserts
   `count()` is still accepted, which is what caught the over-tight first attempt.
+
+  The validated set was then **measured rather than inferred**. Enumerating only the
+  fields this repo's wrapper tools emit gives a narrower set than the v5 API accepts —
+  probing live confirmed `having.expression`, `secondaryAggregations[].expression`,
+  `secondaryAggregations[].groupBy[]` and `selectFields[].name` all return 200, so all
+  four genuinely reached the backend unvalidated. (`filter` as a bare string returns 400,
+  and `functions[]` carries no free-form expression.) SigNoz does check `having`
+  server-side, but relying on that would make this server's guard depend on a backend
+  version.
   Both are asserted in tests.
 
 - **`fleet_health(start, end)`** — per-service `calls`, `errors`, `error_rate`,

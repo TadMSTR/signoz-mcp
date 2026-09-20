@@ -1217,33 +1217,63 @@ async def execute_builder_query(
     # server's TOOL SHAPES, not from its input validation — that distinction is the
     # whole reason this is safe to add.
     #
-    # EVERY caller-supplied free-form string gets the same treatment the wrapper
-    # tools give it, not just `filter`. `aggregations[].expression` is a DSL string
-    # exactly like `filter.expression`, and validating one but not the other would
-    # leave the asymmetry that makes an escape hatch a bypass. `aggregate_traces`
-    # builds its expression through `_build_agg_expression`'s allowlist and its
-    # group-by keys through `_validate_field_name`; a spec arriving here must not
-    # get a weaker check than the same values arriving one function over.
+    # THE SET OF POSITIONS BELOW WAS MEASURED, NOT INFERRED FROM THE WRAPPERS.
+    # Enumerating only the fields the wrapper tools emit gives a NARROWER set than
+    # the API accepts, and the gap is silent. Probed live against SigNoz v0.118.0 on
+    # 2026-09-20 by POSTing each candidate field and reading the status:
+    #
+    #   having.expression                     200  <- accepted, free-form expression
+    #   secondaryAggregations[].expression    200  <- accepted, free-form expression
+    #   secondaryAggregations[].groupBy[]     200  <- accepted, field names
+    #   selectFields[].name                   200  <- accepted, field names
+    #   functions[]                           200  <- accepted, but {name, args} only
+    #   filter as a bare string               400  <- rejected by SigNoz itself
+    #
+    # None of those is emitted by any tool in this file, so all four were reachable
+    # and unvalidated. SigNoz does check `having` server-side (the backtick probe
+    # came back 400 "Invalid references"), but that is SigNoz's defence, not this
+    # server's, and relying on it would make our guard depend on a backend version.
     safe_spec = dict(spec)
 
+    def _check_expression_holder(obj: object) -> None:
+        """Validate an {"expression": "..."} node, wherever it appears."""
+        if isinstance(obj, dict) and isinstance(obj.get("expression"), str):
+            _validate_filter_expr(obj["expression"])
+
+    def _check_field_names(entries: object, what: str) -> None:
+        """Validate a list of {"name": "..."} field-name nodes."""
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                _validate_field_name(entry["name"], what)
+
+    # Free-form expression positions.
     filt = safe_spec.get("filter")
     if isinstance(filt, dict) and isinstance(filt.get("expression"), str):
         safe_spec["filter"] = {**filt, "expression": _validate_filter_expr(filt["expression"])}
     elif isinstance(filt, str):
+        # SigNoz rejects a bare string here (400), but normalising it is kinder than
+        # forwarding something we know will fail — and it must still be validated.
         safe_spec["filter"] = {"expression": _validate_filter_expr(filt)}
+
+    _check_expression_holder(safe_spec.get("having"))
 
     aggs = safe_spec.get("aggregations")
     if isinstance(aggs, list):
         for agg in aggs:
-            if isinstance(agg, dict) and isinstance(agg.get("expression"), str):
-                _validate_filter_expr(agg["expression"])
+            _check_expression_holder(agg)
 
-    # groupBy keys are plain field names, so they get the STRICTER check.
-    group_by = safe_spec.get("groupBy")
-    if isinstance(group_by, list):
-        for entry in group_by:
-            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
-                _validate_field_name(entry["name"], "groupBy field")
+    secondary = safe_spec.get("secondaryAggregations")
+    if isinstance(secondary, list):
+        for agg in secondary:
+            _check_expression_holder(agg)
+            if isinstance(agg, dict):
+                _check_field_names(agg.get("groupBy"), "secondaryAggregations groupBy field")
+
+    # Plain field-name positions get the STRICTER check.
+    _check_field_names(safe_spec.get("groupBy"), "groupBy field")
+    _check_field_names(safe_spec.get("selectFields"), "selectFields field")
 
     # order keys are NOT plain field names — `_build_order` deliberately sends the
     # aggregation expression there ({"key": {"name": "count()"}}), and fleet_health
