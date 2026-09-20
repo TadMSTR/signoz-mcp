@@ -77,6 +77,31 @@ MCP server does not provide. All trace-side, so none is blocked on #926.
   `group_by="name"` and `group_by="service.name,name"` already work. Documented in the
   README with two worked examples, both run against live SigNoz before being committed.
 
+### CodeRabbit re-review findings (PR #7, head `9721111`)
+
+The first review was bound to `9a384d1`; the remediation commits changed the CI gates and
+`compare_windows`' join logic, so a review at that SHA no longer described the code being
+merged. A re-review found two further issues — **both in the remediation itself**.
+
+- **Major: the truncation guard was dead at the maximum limit.**
+  `fetch_limit = min(limit + 1, _MAX_LIMIT_AGG)` collapses to `limit` when the caller asks
+  for the ceiling, so at most `limit` rows can return and `len(out) > limit` is *always
+  false*. The guard added one commit earlier was unreachable at exactly the limit where a
+  window is most likely to be truncated — reinstating the fabricated disappearance it
+  existed to prevent. The caller-visible cap is now `_MAX_LIMIT_AGG - 1`, reserving the
+  over-fetch slot at every reachable limit.
+- **Minor: the `limit`/`offset` clamp coerced instead of rejecting.** `int()` accepts
+  `1.5`, `"250"` and `True`, so the guard silently *changed* values its own error message
+  promised it required to be integers. Now a strict type check, with `bool` excluded
+  explicitly because `isinstance(True, int)` is `True` in Python.
+
+**The first test written for the Major fix was vacuous** and is worth recording. It
+asserted the `limit` sent in the outgoing spec — which is `_MAX_LIMIT_AGG` under both the
+broken and the fixed code, so it passed either way. The observable difference is not what
+is *requested* but whether a missing group on a truncated side returns `None` or `0`. Both
+fixes are now confirmed red against the pre-fix code, the ceiling one failing on
+`assert 0 is None` — the fabricated zero itself.
+
 ### Security audit findings (signoz-mcp-standard-defects-2026-09)
 
 Clean audit — no Critical, High or Medium. Two Low, both remediated.

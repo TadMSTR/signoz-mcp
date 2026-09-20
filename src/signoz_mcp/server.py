@@ -1308,16 +1308,22 @@ async def execute_builder_query(
     # but "the allowlists still apply" is this tool's entire justification for
     # existing, and a ceiling that applies everywhere except the escape hatch is not
     # a ceiling.
+    # REJECT, do not coerce. `int()` happily accepts 1.5, "250" and True, so the
+    # previous `int(...)` guard silently CHANGED those values while its error message
+    # promised it required an integer. A clamp that rewrites input it should have
+    # refused is the same defect as one that refuses input it should have accepted.
+    #
+    # `bool` is excluded explicitly because `isinstance(True, int)` is True in Python
+    # — `{"limit": True}` would otherwise sail through and become 1.
+    def _require_int(name: str, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"spec[{name!r}] must be an integer, got {type(value).__name__}")
+        return value
+
     if "limit" in safe_spec:
-        try:
-            safe_spec["limit"] = min(max(int(safe_spec["limit"]), 1), _MAX_LIMIT_AGG)
-        except (TypeError, ValueError):
-            raise ValueError("spec['limit'] must be an integer") from None
+        safe_spec["limit"] = min(max(_require_int("limit", safe_spec["limit"]), 1), _MAX_LIMIT_AGG)
     if "offset" in safe_spec:
-        try:
-            safe_spec["offset"] = max(int(safe_spec["offset"]), 0)
-        except (TypeError, ValueError):
-            raise ValueError("spec['offset'] must be an integer") from None
+        safe_spec["offset"] = max(_require_int("offset", safe_spec["offset"]), 0)
 
     # These are set by _build_query_payload; a caller overriding them would be
     # reaching past the passthrough into the envelope.
@@ -1443,7 +1449,19 @@ async def compare_windows(
     if not group_keys:
         raise ValueError("group_by must name at least one field")
     group_names = [k["name"] for k in group_keys]
-    limit = min(max(limit, 1), _MAX_LIMIT_AGG)
+    # CEILING IS _MAX_LIMIT_AGG - 1, AND THE -1 IS LOAD-BEARING.
+    #
+    # The truncation detection below asks the backend for `limit + 1` and treats
+    # "got more than limit" as proof there was more. A naive
+    # `fetch_limit = min(limit + 1, _MAX_LIMIT_AGG)` collapses to `limit` at the
+    # maximum, so at most `limit` rows can come back and `len(out) > limit` is
+    # ALWAYS FALSE — the guard is silently dead at exactly the value where a window
+    # is most likely to be truncated, and the fabricated-disappearance bug it exists
+    # to prevent comes straight back.
+    #
+    # Reserving the slot costs one group at the ceiling and keeps the detector alive
+    # at every reachable limit. Found by CodeRabbit on the remediation commit itself.
+    limit = min(max(limit, 1), _MAX_LIMIT_AGG - 1)
 
     # OVER-FETCH BY ONE, so truncation is a FACT rather than a suspicion.
     #
@@ -1459,7 +1477,7 @@ async def compare_windows(
     # a window with exactly `limit` groups is complete and indistinguishable from a
     # truncated one. The extra row is then discarded, so `limit` keeps meaning what it
     # says.
-    fetch_limit = min(limit + 1, _MAX_LIMIT_AGG)
+    fetch_limit = limit + 1  # always reachable: limit is capped at _MAX_LIMIT_AGG - 1
     spec: dict = {
         "aggregations": [{"expression": agg_expr}],
         "groupBy": group_keys,

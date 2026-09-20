@@ -1679,3 +1679,70 @@ async def test_execute_builder_query_rejects_a_non_numeric_limit():
 
     with pytest.raises(ValueError, match="must be an integer"):
         await execute_builder_query(signal="traces", request_type="scalar", spec={"limit": "all"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compare_windows_can_still_detect_truncation_at_the_maximum_limit():
+    """The over-fetch must remain REACHABLE at the ceiling — asserted behaviourally.
+
+    `fetch_limit = min(limit + 1, _MAX_LIMIT_AGG)` collapses to `limit` when the
+    caller asks for the maximum, so at most `limit` rows come back and
+    `len(out) > limit` can never be true. The guard is silently dead at exactly the
+    limit where a window is most likely to BE truncated, and the fabricated
+    disappearance it prevents comes straight back.
+
+    NOTE ON WHAT THIS ASSERTS. An earlier version of this test checked the requested
+    `limit` in the outgoing spec — which is `_MAX_LIMIT_AGG` under BOTH the broken
+    and the fixed code, so it passed either way and proved nothing. The observable
+    difference is not what is asked for, it is whether a missing group on a
+    truncated side comes back as `None` (unknown) or `0` (fabricated).
+    """
+    from signoz_mcp.server import _MAX_LIMIT_AGG, compare_windows
+
+    # A full page from the `before` window: enough rows that the over-fetch slot is
+    # what decides whether truncation is visible at all.
+    full_page = [[f"svc-{i:05d}", 1000 - (i % 997)] for i in range(_MAX_LIMIT_AGG)]
+    bodies = [
+        _v5_scalar(["service.name", "__result_0"], full_page),
+        # `after` is small and complete, and contains a group the big page does not.
+        _v5_scalar(["service.name", "__result_0"], [["newcomer", 250]]),
+    ]
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=bodies[len(captured) - 1])
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+
+    rows = await compare_windows(window_a="-48h", window_b="-24h", limit=_MAX_LIMIT_AGG)
+    newcomer = next(r for r in rows if r["service.name"] == "newcomer")
+
+    assert newcomer["before"] is None, (
+        "the `before` window returned a full page and must be treated as TRUNCATED, "
+        "so `newcomer`'s absence from it is unknown rather than zero. Getting 0 here "
+        "means the over-fetch slot was lost and truncation is undetectable at the "
+        "ceiling."
+    )
+    assert newcomer["delta"] is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("bad", [1.5, "250", True, None, [1]])
+async def test_execute_builder_query_rejects_non_int_limit_rather_than_coercing(bad):
+    """`int()` accepts 1.5, "250" and True — silently CHANGING them.
+
+    The first version of this clamp used `int(...)`, so it rewrote values its own
+    error message claimed it required to be integers. bool is called out because
+    `isinstance(True, int)` is True in Python, so `{"limit": True}` would otherwise
+    become 1.
+    """
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_scalar([], []))
+    )
+    from signoz_mcp.server import execute_builder_query
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        await execute_builder_query(signal="traces", request_type="scalar", spec={"limit": bad})
