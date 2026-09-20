@@ -50,7 +50,7 @@ register_before("tail_logs", force_recent_window)
 
 ## Bundled audit-log hook
 
-`signoz_mcp/contrib/audit_log.py` ships a ready-made **before** hook that logs one
+`src/signoz_mcp/contrib/audit_log.py` ships a ready-made **before** hook that logs one
 structured line per call — the tool name, the caller (`anonymous`, since signoz-mcp uses a
 single shared service-account key rather than per-caller tokens), and a **hash** of the
 arguments (never the raw values). `server.main` registers it across all tools at startup;

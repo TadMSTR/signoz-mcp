@@ -17,7 +17,7 @@ into the sysadmin agent's scoped-mcp config.
 ## Structure
 
 ```
-signoz_mcp/
+src/signoz_mcp/
   __init__.py     Package marker
   __main__.py     python -m signoz_mcp entry point
   _client.py      Shared httpx client, query helper, auth header, error sanitizing
@@ -79,11 +79,11 @@ Raises `RuntimeError` at startup if `SIGNOZ_API_KEY` is empty or unset, or if
 
 ## Extension points
 
-- **Add new tools:** `signoz_mcp/server.py` — follow the existing `@tool` pattern
+- **Add new tools:** `src/signoz_mcp/server.py` — follow the existing `@tool` pattern
   (instruments the tool with hooks + telemetry); add corresponding tests.
-- **Intercept calls:** register pre/post hooks via `signoz_mcp/hooks.py` — see
+- **Intercept calls:** register pre/post hooks via `src/signoz_mcp/hooks.py` — see
   `docs/extension-hooks.md`.
-- **Do not modify:** `signoz_mcp/_client.py` auth header / error handling without security review.
+- **Do not modify:** `src/signoz_mcp/_client.py` auth header / error handling without security review.
 
 ## Out of scope for agents
 

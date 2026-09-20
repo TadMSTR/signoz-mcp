@@ -1,4 +1,4 @@
-"""Tests for signoz_mcp/hooks.py and the server.instrument hook wiring."""
+"""Tests for src/signoz_mcp/hooks.py and the server.instrument hook wiring."""
 
 from __future__ import annotations
 

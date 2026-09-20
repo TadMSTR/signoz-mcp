@@ -32,7 +32,7 @@ Issues = "https://github.com/TadMSTR/signoz-mcp/issues"
 Changelog = "https://github.com/TadMSTR/signoz-mcp/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# All telemetry backends are optional and off by default (see signoz_mcp/telemetry.py).
+# All telemetry backends are optional and off by default (see src/signoz_mcp/telemetry.py).
 # The base install carries none of these; enabling a backend needs this extra.
 telemetry = [
     "opentelemetry-sdk>=1.20",
@@ -53,6 +53,7 @@ dev = [
 signoz-mcp = "signoz_mcp.server:main"
 
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["signoz_mcp*"]
 
 [tool.pytest.ini_options]
@@ -70,8 +71,8 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.coverage.run]
 omit = [
-    "signoz_mcp/__main__.py",
-    "signoz_mcp/observability.py",
+    "src/signoz_mcp/__main__.py",
+    "src/signoz_mcp/observability.py",
 ]
 
 [tool.coverage.report]

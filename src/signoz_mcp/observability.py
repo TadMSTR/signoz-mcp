@@ -62,5 +62,5 @@ def configure_logging() -> None:
     )
 
 
-# OTEL tracing + metrics now live in signoz_mcp/telemetry.py (opt-in via
+# OTEL tracing + metrics now live in src/signoz_mcp/telemetry.py (opt-in via
 # OTEL_EXPORTER_OTLP_ENDPOINT, wired into every tool call by server.instrument).

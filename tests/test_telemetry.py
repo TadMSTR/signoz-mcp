@@ -1,4 +1,4 @@
-"""Tests for signoz_mcp/telemetry.py — disabled path and the _emit fan-out.
+"""Tests for src/signoz_mcp/telemetry.py — disabled path and the _emit fan-out.
 
 The base/[dev] install carries none of the telemetry backends, so these tests exercise
 the no-op path and mock the OTLP/Influx sinks rather than requiring the optional deps.

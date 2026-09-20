@@ -2,7 +2,7 @@
 
 ## How to add a tool
 
-1. Add a new `@mcp.tool()` function in `signoz_mcp/server.py`
+1. Add a new `@mcp.tool()` function in `src/signoz_mcp/server.py`
    - Keep tools read-only — signoz-mcp is a strictly read/query interface
    - Use the shared `SigNozClient` from `_client.py`
    - Validate all inputs before passing to the API (see `_METRIC_NAME_RE` for the validation pattern)

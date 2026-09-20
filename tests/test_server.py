@@ -1,4 +1,4 @@
-"""Tests for signoz_mcp/server.py and signoz_mcp/_client.py.
+"""Tests for src/signoz_mcp/server.py and src/signoz_mcp/_client.py.
 
 API compatibility note: signoz-mcp targets the SigNoz v5 query_range API used by
 v0.118. The mock helpers below reproduce the real response envelopes:
