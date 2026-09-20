@@ -40,10 +40,12 @@ guaranteed to fire around every invocation of it — including calls that arrive
 ```python
 from signoz_mcp.hooks import register_before
 
+
 async def force_recent_window(kwargs: dict) -> dict:
     # Cap unbounded log tails to the last 15 minutes.
     kwargs.setdefault("start", "-15m")
     return kwargs
+
 
 register_before("tail_logs", force_recent_window)
 ```

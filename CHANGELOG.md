@@ -42,6 +42,25 @@ MCP server does not provide. All trace-side, so none is blocked on #926.
   `group_by="name"` and `group_by="service.name,name"` already work. Documented in the
   README with two worked examples, both run against live SigNoz before being committed.
 
+### CI fixes found by the new gates themselves
+
+Both were caught on the PR's first CI run, by gates this build added. Recorded because
+in both cases the local result was green and the CI result was the true one.
+
+- **The gitleaks gate was inert under the pinned version.** The planted value was 36
+  repeated `A`s; gitleaks **8.28.0** applies an entropy floor to its `github-pat` rule, so
+  that string scores 0.67 and is not reported, while the forge host's unpinned
+  `/usr/bin/gitleaks` has no such floor and did report it. The probe passed locally
+  against a looser binary while the gate could not fail in CI. Planted value now scores
+  5.22 and is detected by both; the probe prints the gitleaks version so a skew is
+  visible.
+
+- **`ruff` was unpinned, so the formatter gate depended on when you ran it.** Local
+  0.15.22 vs CI 0.16.8: `ruff format --check` went red in CI on files `ruff format` had
+  just cleaned locally, because 0.16 formats Python code blocks **inside Markdown** and
+  0.15 does not. Now pinned `ruff==0.16.8`, with bumps arriving through Dependabot's
+  batched dev PR where a formatting change is visible in one diff.
+
 ### Fixed
 
 - **`list_services` returned an incomplete set (vikunja#322).** It called

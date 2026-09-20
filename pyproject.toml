@@ -57,7 +57,16 @@ dev = [
     "pytest-asyncio>=0.23",
     "respx>=0.21",
     "pytest-cov>=4.0",
-    "ruff",
+    # PINNED EXACTLY, and the exactness is the point. `ruff` was unbounded, so the CI
+    # matrix installed whatever was newest while the local venv held whatever it had.
+    # Measured 2026-09-20: local 0.15.22 vs CI 0.16.8 — `ruff format --check` went red
+    # in CI on code that `ruff format` had just cleaned locally, because the formatter's
+    # own rules changed between those versions. A formatter that is not pinned is a gate
+    # whose result depends on when you ran it.
+    #
+    # Bumps come via Dependabot's batched dev-dependency PR, which is where a formatting
+    # change belongs: visible, in one diff, and deliberate.
+    "ruff==0.16.8",
 ]
 
 [project.scripts]

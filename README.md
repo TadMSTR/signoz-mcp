@@ -111,13 +111,19 @@ unit rather than per-service. `group_by` already reaches it — no separate tool
 
 ```python
 # Which tool calls are slowest, across the fleet?
-aggregate_traces(aggregation="p95", aggregate_on="duration_nano",
-                 group_by="service.name,name", start="-168h")
+aggregate_traces(
+    aggregation="p95", aggregate_on="duration_nano", group_by="service.name,name", start="-168h"
+)
 
 # Did a specific tool get slower since yesterday?
-compare_windows(window_a="-48h", window_b="-24h",
-                aggregation="p95", aggregate_on="duration_nano",
-                group_by="name", filter="service.name = 'scoped-mcp-developer'")
+compare_windows(
+    window_a="-48h",
+    window_b="-24h",
+    aggregation="p95",
+    aggregate_on="duration_nano",
+    group_by="name",
+    filter="service.name = 'scoped-mcp-developer'",
+)
 ```
 
 `name` is the span name; `service.name,name` groups by both.
