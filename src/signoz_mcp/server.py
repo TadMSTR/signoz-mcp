@@ -1191,7 +1191,10 @@ async def execute_builder_query(
         request_type: 'scalar' or 'time_series'.
         spec:         The builder_query spec body — `aggregations`, `groupBy`,
                       `filter`, `order`, `limit`, `offset`. `name`, `signal` and
-                      `disabled` are supplied for you.
+                      `disabled` are supplied for you. `limit` is clamped to
+                      1..10,000 and `offset` to >= 0, the same ceilings the
+                      wrapper tools apply — the escape hatch is from this server's
+                      tool SHAPES, not from its limits.
         start/end:    Window, e.g. '-24h' / 'now'.
 
     Returns:
@@ -1290,6 +1293,31 @@ async def execute_builder_query(
                 _validate_filter_expr(nested["name"])
             elif isinstance(entry.get("name"), str):
                 _validate_filter_expr(entry["name"])
+
+    # NUMERIC BOUNDS APPLY TOO. Security audit F-01
+    # (signoz-mcp-standard-defects-2026-09): every other tool in this file clamps
+    # `limit` before building its spec, and this one forwarded whatever the caller
+    # put in the dict. That was the same asymmetry the expression/field-name
+    # validation above exists to close — just in a position that is not a string, so
+    # the pass that found those did not look at it.
+    #
+    # _MAX_LIMIT_AGG rather than _MAX_LIMIT_RAW because request_type is validated
+    # against {"scalar", "time_series"} above; the raw path is not reachable here.
+    #
+    # Read-only backend, so the concern is cost and response size, not data access —
+    # but "the allowlists still apply" is this tool's entire justification for
+    # existing, and a ceiling that applies everywhere except the escape hatch is not
+    # a ceiling.
+    if "limit" in safe_spec:
+        try:
+            safe_spec["limit"] = min(max(int(safe_spec["limit"]), 1), _MAX_LIMIT_AGG)
+        except (TypeError, ValueError):
+            raise ValueError("spec['limit'] must be an integer") from None
+    if "offset" in safe_spec:
+        try:
+            safe_spec["offset"] = max(int(safe_spec["offset"]), 0)
+        except (TypeError, ValueError):
+            raise ValueError("spec['offset'] must be an integer") from None
 
     # These are set by _build_query_payload; a caller overriding them would be
     # reaching past the passthrough into the envelope.

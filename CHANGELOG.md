@@ -59,6 +59,32 @@ MCP server does not provide. All trace-side, so none is blocked on #926.
   `group_by="name"` and `group_by="service.name,name"` already work. Documented in the
   README with two worked examples, both run against live SigNoz before being committed.
 
+### Security audit findings (signoz-mcp-standard-defects-2026-09)
+
+Clean audit — no Critical, High or Medium. Two Low, both remediated.
+
+- **F-01: `execute_builder_query` forwarded `limit`/`offset` unbounded.** Every other tool
+  here clamps `limit` to `_MAX_LIMIT_RAW`/`_MAX_LIMIT_AGG` before building its spec; the
+  passthrough copied the caller's dict straight through. Same asymmetry the expression and
+  field-name validation exists to close, in a position that is **not a string** — which is
+  exactly why the pass that found those missed it. Read-only backend, so the concern is
+  scan cost and response size rather than data access, but a ceiling that applies
+  everywhere except the escape hatch is not a ceiling. Now clamped to `1..10_000` and
+  `offset >= 0`, with a non-numeric value rejected outright.
+- **F-02: gitleaks installed without checksum verification** — already fixed in `1ca2ed8`
+  before the audit landed. The audit ran against `9a384d1`, which predates the fix.
+  **CodeRabbit and the security agent found this independently**, which is the useful
+  signal: two reviewers with different methods converging on the same gap.
+
+Also closed: the `accepted-risks.md` row for signoz-mcp's *"pip-audit absent from venv"*
+(Info, accepted 2026-05-31) — resolved by this build's lockfile-reading split audit gates.
+
+**Left open:** whether the measured `execute_builder_query` field set is complete against
+SigNoz v0.118's `builder_query` struct. The audit could not independently re-verify it —
+the branch is unmerged, so there is no running instance to probe — and confirmed only that
+the validation is internally consistent with what was measured. A live probe pass after
+deployment, or a read of SigNoz's struct definition, would close it properly.
+
 ### CodeRabbit review findings (PR #7)
 
 Five findings, all valid, all fixed. Two are notable for being the same class of defect

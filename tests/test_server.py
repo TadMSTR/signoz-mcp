@@ -1615,3 +1615,67 @@ async def test_compare_windows_uses_zero_when_the_window_was_not_truncated():
     assert by_service["gone"]["after"] == 0, "neither window was truncated"
     assert by_service["gone"]["delta"] == -50
     assert by_service["gone"]["pct_change"] == -100.0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_builder_query_clamps_limit_and_offset():
+    """Security audit F-01 — the passthrough forwarded numeric bounds unchanged.
+
+    Every other tool here clamps `limit` before building its spec. This one copied
+    the caller's dict straight through, so the file's limit discipline applied
+    everywhere EXCEPT the escape hatch — and "the allowlists still apply" is this
+    tool's whole justification. The gap survived the expression/field-name review
+    pass because `limit` is not a string.
+    """
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=_v5_scalar([], []))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import _MAX_LIMIT_AGG, execute_builder_query
+
+    await execute_builder_query(
+        signal="traces",
+        request_type="scalar",
+        spec={"limit": 10_000_000, "offset": -5},
+    )
+
+    spec = captured[0]["compositeQuery"]["queries"][0]["spec"]
+    assert spec["limit"] == _MAX_LIMIT_AGG
+    assert spec["offset"] == 0
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_builder_query_leaves_a_reasonable_limit_alone():
+    """The accept side — clamping must not rewrite a value that was already fine."""
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=_v5_scalar([], []))
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import execute_builder_query
+
+    await execute_builder_query(
+        signal="traces", request_type="scalar", spec={"limit": 250, "offset": 10}
+    )
+    spec = captured[0]["compositeQuery"]["queries"][0]["spec"]
+    assert spec["limit"] == 250
+    assert spec["offset"] == 10
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_execute_builder_query_rejects_a_non_numeric_limit():
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_scalar([], []))
+    )
+    from signoz_mcp.server import execute_builder_query
+
+    with pytest.raises(ValueError, match="must be an integer"):
+        await execute_builder_query(signal="traces", request_type="scalar", spec={"limit": "all"})
