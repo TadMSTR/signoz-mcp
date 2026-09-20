@@ -15,7 +15,7 @@ Targets the SigNoz **v5** query API (v0.118+).
 | `search_traces` | Search traces by a free-form filter expression + shortcut params (service, operation, error, duration bounds) |
 | `aggregate_traces` | Aggregate traces (count/count_distinct/avg/sum/min/max/p50–p99/rate) grouped by field(s); scalar or time_series |
 | `get_trace_details` | Every span in a trace (`include_spans=True`) or a one-row trace summary |
-| `tail_logs` | Recent logs filtered by severity |
+| `tail_logs` | Most recent logs at a severity, newest first. No `service` parameter — see [vikunja#926](#logs) |
 | `search_logs` | Search logs by a free-form filter expression + shortcut params (service, severity, body search) |
 | `aggregate_logs` | Aggregate logs grouped by field(s); scalar or time_series |
 | `query_metric` | Named metric time series with an optional label filter |
@@ -75,3 +75,23 @@ pytest --cov=signoz_mcp --cov-report=term-missing
 ruff check .
 ruff format .
 ```
+
+## Logs
+
+**The log tools currently raise rather than return `[]`.** Nothing on forge exports OTLP
+logs and the collector has no `filelog` receiver, so SigNoz's log store is empty —
+measured 0 rows at `-720h`, while `get_health()` and `aggregate_traces` both pass as
+controls (vikunja#926).
+
+Rather than return an empty list that an agent would read as "no matching logs",
+`tail_logs` and `search_logs` detect the no-data-at-all case and raise a message naming
+the ticket. The distinguisher is that the logs signal reports **only SigNoz's built-in
+schema keys** (`fieldContext` `log`/`scope`) and none derived from ingested data
+(`resource`/`attribute`). Note that the field-keys payload is *not* empty on an empty
+store — it holds eight built-ins — so a check written against emptiness would never fire.
+
+`tail_logs` takes no `service` argument. It previously accepted one, validated it, and
+then filtered on severity alone (vikunja#927). Which key names a service in the logs
+signal is still unresolved — `search_logs` emits `service.name`, `aggregate_logs`'
+docstring recommends `resource.service.name` — and it cannot be settled until there is
+log data to test against. Trace-side tools are unaffected.

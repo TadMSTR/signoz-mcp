@@ -30,6 +30,33 @@ def _patch_env(monkeypatch):
     monkeypatch.setenv("SIGNOZ_QUERY_VERSION", "v5")
 
 
+# Log field-key payloads, shaped from the real SigNoz v0.118.0 response.
+#
+# _BUILTIN_ONLY_LOG_KEYS is what forge returns TODAY with zero ingested logs: eight
+# keys, all at fieldContext 'log' or 'scope'. It is deliberately NOT empty — that is
+# the whole point, and a guard testing for emptiness would never fire against it.
+_BUILTIN_ONLY_LOG_KEYS = {
+    "data": {
+        "keys": {
+            "body": [{"name": "body", "signal": "logs", "fieldContext": "log"}],
+            "severity_text": [{"name": "severity_text", "signal": "logs", "fieldContext": "log"}],
+            "scope_name": [{"name": "scope_name", "signal": "logs", "fieldContext": "scope"}],
+        }
+    }
+}
+
+_POPULATED_LOG_KEYS = {
+    "data": {
+        "keys": {
+            "body": [{"name": "body", "signal": "logs", "fieldContext": "log"}],
+            "service.name": [
+                {"name": "service.name", "signal": "logs", "fieldContext": "resource"}
+            ],
+        }
+    }
+}
+
+
 # ── Time helpers ──────────────────────────────────────────────────────────────
 
 
@@ -551,17 +578,28 @@ async def test_tail_logs_happy_path():
     )
     from signoz_mcp.server import tail_logs
 
-    result = await tail_logs(service="backend")
+    result = await tail_logs()
     assert len(result) == 1
     assert result[0]["body"] == "boom"
 
 
 @pytest.mark.asyncio
-async def test_tail_logs_rejects_invalid_service():
+async def test_tail_logs_takes_no_service_parameter():
+    """vikunja#927 — `service` was required, validated, and then never used.
+
+    This replaces test_tail_logs_rejects_invalid_service, which asserted the
+    validation of a parameter that had no effect on the query. That test passed
+    against the defect: validating an argument you then discard is precisely the
+    bug, so a test of the validation alone could never have caught it.
+    """
+    import inspect
+
     from signoz_mcp.server import tail_logs
 
-    with pytest.raises(ValueError):
-        await tail_logs(service="../../etc/passwd")
+    assert "service" not in inspect.signature(tail_logs).parameters
+
+    with pytest.raises(TypeError):
+        await tail_logs(service="backend")
 
 
 @pytest.mark.asyncio
@@ -569,10 +607,10 @@ async def test_tail_logs_rejects_invalid_severity():
     from signoz_mcp.server import tail_logs
 
     with pytest.raises(ValueError):
-        await tail_logs(service="backend", severity="ERROR' OR 1=1 --")
+        await tail_logs(severity="ERROR' OR 1=1 --")
 
     with pytest.raises(ValueError):
-        await tail_logs(service="backend", severity="INVALID")
+        await tail_logs(severity="INVALID")
 
 
 @pytest.mark.asyncio
@@ -585,12 +623,98 @@ async def test_tail_logs_uses_severity_text_filter():
         return Response(200, json=_v5_raw([]))
 
     respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    # The empty result now consults the field keys to tell "no matches" from "no log
+    # data at all" (vikunja#926). Report a populated signal so this test stays about
+    # the filter expression.
+    respx.get("http://localhost:8080/api/v1/fields/keys").mock(
+        return_value=Response(200, json=_POPULATED_LOG_KEYS)
+    )
     from signoz_mcp.server import tail_logs
 
-    await tail_logs(service="backend", severity="warn")
+    await tail_logs(severity="warn")
     spec = json.loads(captured[0])["compositeQuery"]["queries"][0]["spec"]
     assert "severity_text" in spec["filter"]["expression"]
     assert "WARN" in spec["filter"]["expression"]
+
+
+# ── Empty log store vs. no matching logs (vikunja#926) ────────────────────────
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_empty_result_names_926_when_nothing_has_been_ingested():
+    """The whole point: [] must stop meaning two different things.
+
+    An agent that cannot tell "no matching logs" from "this backend holds no logs"
+    diagnoses the former and never finds the latter — which is what vikunja#909
+    was, parse errors debugged against an empty table.
+    """
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_raw([]))
+    )
+    respx.get("http://localhost:8080/api/v1/fields/keys").mock(
+        return_value=Response(200, json=_BUILTIN_ONLY_LOG_KEYS)
+    )
+    from signoz_mcp.server import tail_logs
+
+    with pytest.raises(ValueError) as exc_info:
+        await tail_logs()
+    assert "vikunja#926" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_empty_result_is_returned_plainly_when_the_store_has_data():
+    """The other side of the guard — it must not fire on a real empty result."""
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_raw([]))
+    )
+    respx.get("http://localhost:8080/api/v1/fields/keys").mock(
+        return_value=Response(200, json=_POPULATED_LOG_KEYS)
+    )
+    from signoz_mcp.server import tail_logs
+
+    assert await tail_logs() == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_search_logs_empty_result_also_names_926():
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_raw([]))
+    )
+    respx.get("http://localhost:8080/api/v1/fields/keys").mock(
+        return_value=Response(200, json=_BUILTIN_ONLY_LOG_KEYS)
+    )
+    from signoz_mcp.server import search_logs
+
+    with pytest.raises(ValueError) as exc_info:
+        await search_logs(severity="ERROR")
+    assert "vikunja#926" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_guard_reads_field_context_not_key_count():
+    """Guards against the version of this check that could never fire.
+
+    The obvious implementation — "are there any field keys at all?" — would be
+    permanently satisfied, because SigNoz reports its built-in log schema on an
+    empty store. Measured on forge 2026-09-20: 8 keys, all at fieldContext
+    'log'/'scope', zero at 'resource'/'attribute'. This fixture has keys; the
+    guard must still fire.
+    """
+    assert _BUILTIN_ONLY_LOG_KEYS["data"]["keys"], "fixture must be non-empty to mean anything"
+    respx.post("http://localhost:8080/api/v5/query_range").mock(
+        return_value=Response(200, json=_v5_raw([]))
+    )
+    respx.get("http://localhost:8080/api/v1/fields/keys").mock(
+        return_value=Response(200, json=_BUILTIN_ONLY_LOG_KEYS)
+    )
+    from signoz_mcp.server import tail_logs
+
+    with pytest.raises(ValueError):
+        await tail_logs()
 
 
 # ── search_logs ───────────────────────────────────────────────────────────────

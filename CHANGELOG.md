@@ -17,6 +17,38 @@
 
 ### Changed
 
+- **`tail_logs` validated a `service` argument and then discarded it (vikunja#927).**
+  `service` was its only *required* parameter; it was validated at the top of the body
+  and never referenced again, because the spec filtered on `severity_text` alone. The
+  docstring recorded this as a design note, which is what kept it from looking like a
+  bug. It returned nothing today only because the store is empty — the moment #926 is
+  fixed it becomes a silent wrong-answer path.
+
+  **The parameter is dropped, not wired up.** Scoping it means choosing a filter key,
+  and the two log tools disagree about which key that is (`search_logs` emits
+  `service.name`; `aggregate_logs`' docstring recommends `resource.service.name`, while
+  its own body emits `service.name`). With no log data, any choice is untestable — and
+  this tool is already the result of one guess written up as a decision. The
+  disagreement is now recorded in a code comment against #926 rather than silently
+  resolved. **Breaking for callers passing `service=`.**
+
+- **Empty log results stop being ambiguous.** Every log tool returned `[]` for both "no
+  matching logs" and "this backend holds no logs at all", and an agent cannot tell those
+  apart — which is what produced vikunja#909, parse errors diagnosed against an empty
+  table. `tail_logs` and `search_logs` now check, **on the empty path only**, whether the
+  logs signal carries any field key derived from ingested data, and raise naming #926 if
+  not.
+
+  The mechanism is *not* the obvious one. This build's plan proposed treating an empty
+  `get_field_keys(signal="logs")` as the signal; measured against SigNoz v0.118.0 on
+  2026-09-20 that payload is **not empty** on an empty store — it carries eight built-in
+  schema keys at `fieldContext` `log`/`scope`. A guard written that way could never have
+  fired. What actually distinguishes the two is `resource`/`attribute` context keys,
+  which only exist once something has been ingested: **logs 0, traces 156, metrics 63**.
+  A test asserts the guard still fires against a *non-empty* key payload, so the weaker
+  version cannot be reintroduced silently.
+
+
 - **`list_services` is now time-bounded and returns dicts.** New `start`/`end` parameters
   (defaults `-1h`/`now`), for parity with `search_traces`, `aggregate_traces` and
   `list_metrics`. The return type changes from `list[str]` to `list[dict]` carrying

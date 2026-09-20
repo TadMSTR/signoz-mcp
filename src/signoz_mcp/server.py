@@ -4,7 +4,7 @@ Read-only access to SigNoz services, traces, logs, metrics, and alert rules.
 Gives agents direct query access without requiring a Grafana or SigNoz UI session.
 
 Tools:
-  list_services      — All service names registered in SigNoz
+  list_services      — Services seen in a time window, with their RED metrics
   search_traces      — Search traces by free-form filter + shortcut params
   aggregate_traces   — Aggregate traces (count/p99/avg/...) grouped by field(s)
   get_trace_details  — Full span list for one trace ID
@@ -419,6 +419,63 @@ def _parse_aggregate(body: dict, request_type: str) -> list[dict]:
     return [{"labels": labels, "values": values} for labels, values in _iter_agg_series(body)]
 
 
+# ── Empty-log-store distinguisher (vikunja#926) ───────────────────────────────
+
+# Contexts that only exist once something has actually been INGESTED. SigNoz always
+# reports its built-in log schema — `body`, `severity_number`, `scope_name` and so on,
+# at fieldContext 'log' and 'scope' — whether or not a single log line has ever
+# arrived. Resource and attribute keys are different: they are derived from the data.
+#
+# MEASURED ON FORGE, 2026-09-20, against SigNoz v0.118.0:
+#
+#   signal    total keys    contexts                                  resource|attribute
+#   logs               8    {log: 6, scope: 2}                                         0
+#   traces           181    {attribute: 136, resource: 21, span: 23, scope: 2}       156
+#   metrics           64    {attribute: 47, resource: 21, metric: 1}                  63
+#
+# This matters because the obvious form of this check does NOT work. The plan for this
+# build proposed testing whether the logs signal has any field keys at all and treating
+# empty as the signal — but the payload is not empty on an empty store, it holds those
+# eight built-ins. A guard written that way would never once have fired.
+_DERIVED_FIELD_CONTEXTS = frozenset({"resource", "attribute"})
+
+
+async def _logs_signal_has_ingested_data() -> bool:
+    """True if the logs signal carries any field key derived from real data."""
+    data = await client.get("/api/v1/fields/keys", params={"signal": "logs"})
+    payload = data.get("data", {}) if isinstance(data, dict) else {}
+    keys = payload.get("keys") or {}
+    return any(
+        defn.get("fieldContext") in _DERIVED_FIELD_CONTEXTS
+        for defns in keys.values()
+        if isinstance(defns, list)
+        for defn in defns
+        if isinstance(defn, dict)
+    )
+
+
+async def _raise_if_logs_signal_is_empty() -> None:
+    """Distinguish "no matching logs" from "this backend holds no logs at all".
+
+    Every log tool here returns `[]` for both, and an agent cannot tell them apart.
+    That ambiguity is what produced vikunja#909: parse errors were diagnosed against
+    a table that had nothing in it, so no filter expression could ever have worked.
+
+    Called only on the EMPTY path, so this costs one extra request exactly when the
+    result would otherwise have been uninformative — never on a successful query.
+    """
+    if await _logs_signal_has_ingested_data():
+        return  # genuinely no matching rows; the caller's empty list is the answer
+    raise ValueError(
+        "SigNoz holds no log data at all — this is not an empty result for your "
+        "query. The logs signal reports only SigNoz's built-in schema keys and no "
+        "resource or attribute keys, meaning nothing has ever been ingested. "
+        "Nothing on forge currently exports OTLP logs and the collector has no "
+        "filelog receiver: see vikunja#926. Narrowing or widening this query will "
+        "not help; trace-side tools (search_traces, aggregate_traces) are unaffected."
+    )
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 
@@ -671,29 +728,37 @@ async def get_trace_details(
 
 @tool
 async def tail_logs(
-    service: str,
     severity: str = "ERROR",
     start: str = "-1h",
     end: str = "now",
     limit: int = 50,
 ) -> list[dict]:
-    """Return recent logs filtered by severity.
+    """Return the most recent logs at a given severity, newest first.
 
     Args:
-        service:  Service name (validated; recorded for context — see note).
         severity: Log severity level, e.g. 'ERROR', 'WARN', 'INFO'. Case-insensitive.
         start:    Start time, e.g. '-1h'. end: end time (default 'now').
         limit:    Max log lines to return (max 500).
 
-    Note:
-        In forge's v5 log schema, service name is a resource attribute that is not
-        reliably filterable in the log filter parser, so this tool filters on
-        severity_text only. Use search_logs(filter=...) for richer log filtering.
-
     Returns:
         List of log dicts with timestamp, severity_text, body, and resource fields.
+
+    To scope by service, use `search_logs(filter=...)` — but see vikunja#926 first:
+    no service on forge currently exports OTLP logs, so the log store is empty and
+    no service-scoping filter can be verified against real data today.
     """
-    _validate_service(service)
+    # vikunja#927. This took a REQUIRED `service` argument, validated it at the top
+    # of the body, and then never referenced it again — the spec below filtered on
+    # severity_text alone. Callers got a plausible-looking answer that had silently
+    # ignored the one thing they asked to narrow by.
+    #
+    # The parameter is DROPPED rather than wired into the filter. Scoping it properly
+    # means choosing a filter key, and the two log tools in this file already
+    # disagree about which key that is (see the note in search_logs). With the log
+    # store empty, either choice is a guess that cannot be tested — and this tool is
+    # already the result of one guess that got written into a docstring as though it
+    # were a design decision. Picking the key belongs to the build that fixes #926,
+    # where get_field_keys(signal="logs") will finally return data-derived keys.
     sev = _validate_severity(severity)
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
@@ -705,7 +770,10 @@ async def tail_logs(
         "limit": limit,
     }
     body = await client.query("logs", "raw", spec, start_ms, end_ms)
-    return _extract_rows(body)[:limit]
+    rows = _extract_rows(body)[:limit]
+    if not rows:
+        await _raise_if_logs_signal_is_empty()
+    return rows
 
 
 @tool
@@ -723,9 +791,9 @@ async def search_logs(
 
     Args:
         filter:      Free-form SigNoz filter expression, AND-combined with shortcuts.
-        service:     Shortcut for "service.name = '<service>'". Note: forge's log
-                     pipeline may not index service.name as filterable — this can
-                     return a parse error; prefer narrowing by time + severity.
+        service:     Shortcut for "service.name = '<service>'". UNVERIFIED — see the
+                     note in the body about vikunja#926; this may return a parse
+                     error. Prefer narrowing by time + severity until logs exist.
         severity:    Shortcut for "severity_text = '<SEVERITY>'".
         search_text: Shortcut for "body CONTAINS '<text>'" (log body substring).
         start:       Start time (default '-1h'). end: end time (default 'now').
@@ -734,6 +802,16 @@ async def search_logs(
     Returns:
         List of log dicts (timestamp, severity_text, body, resource fields, ...).
     """
+    # WHICH KEY NAMES A SERVICE IN THE LOGS SIGNAL IS UNRESOLVED (vikunja#926).
+    # This function emits `service.name`. aggregate_logs' docstring recommends
+    # `resource.service.name` while its own body also emits `service.name`, so the
+    # two tools — and one of them internally — disagree. They cannot all be right.
+    #
+    # Deliberately NOT resolved here. get_field_keys(signal="logs") returns only
+    # SigNoz's built-in schema and no resource keys at all, because nothing has ever
+    # been ingested, so picking a key now would be a guess dressed as a decision —
+    # which is exactly how vikunja#927 happened one tool over. The correction belongs
+    # to the build that fixes ingestion, where the field keys will finally say.
     parts: list[str] = []
     if filter:
         parts.append(_validate_filter_expr(filter))
@@ -760,7 +838,10 @@ async def search_logs(
         spec["filter"] = {"expression": " AND ".join(parts)}
 
     body = await client.query("logs", "raw", spec, start_ms, end_ms)
-    return _extract_rows(body)[:limit]
+    rows = _extract_rows(body)[:limit]
+    if not rows:
+        await _raise_if_logs_signal_is_empty()
+    return rows
 
 
 @tool
