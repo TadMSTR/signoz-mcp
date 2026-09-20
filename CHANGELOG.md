@@ -1,6 +1,24 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] — 2026-09-20
+
+### Breaking
+
+Two tool signatures changed. Both were silently-wrong-answer paths, so the break is the
+fix rather than a side effect of it — a caller that keeps working unchanged is a caller
+still getting the wrong answer.
+
+- **`list_services` returns `list[dict]`, not `list[str]`**, and takes `start`/`end`.
+  Each dict carries SigNoz's own field names (`serviceName`, `p99`, `avgDuration`,
+  `numCalls`, `callRate`, `numErrors`, `errorRate`, `num4XX`, `fourXXRate`). Callers
+  treating the result as a list of strings must read `serviceName`.
+- **`tail_logs` no longer accepts `service`.** It validated the argument and then filtered
+  on severity alone, so passing it never did anything; it is now a `TypeError` rather than
+  a silent no-op. Use `search_logs(filter=...)` — but read the Logs section of the README
+  first (vikunja#926).
+
+Version is `0.4.0` rather than `0.3.1` because for a `0.x` package the **minor** is the
+breaking boundary — the same rule this build applied to `httpx>=0.27,<0.29`.
 
 ### Added — the fleet-operator surface
 
