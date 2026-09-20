@@ -1,0 +1,21 @@
+# CODEOWNERS — F2.
+#
+# Single-maintainer repository, so this is one line rather than a routing table.
+# It is required under `visibility: public` for a reason that is not about routing:
+# OSSF Scorecard reads it, and on a public repo it is the machine-readable answer to
+# "who is accountable for a change here" for someone who has never met the maintainer.
+#
+# The tighter rules below are not redundant with the catch-all. GitHub applies the LAST
+# matching pattern, so these override it — they exist to make the two files that carry
+# the security contract impossible to change without the owner being requested, even if
+# the catch-all is ever narrowed.
+
+*                           @TadMSTR
+
+# The auth header, error sanitising and the never-leak-the-key contract live here.
+# AGENTS.md says not to modify this file's auth/error handling without security review.
+/src/signoz_mcp/_client.py  @TadMSTR
+
+# Workflows hold the credentials. CodeQL's `actions` language scans these for the same
+# reason this line exists.
+/.github/                   @TadMSTR

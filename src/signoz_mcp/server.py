@@ -4,7 +4,7 @@ Read-only access to SigNoz services, traces, logs, metrics, and alert rules.
 Gives agents direct query access without requiring a Grafana or SigNoz UI session.
 
 Tools:
-  list_services      — All service names registered in SigNoz
+  list_services      — Services seen in a time window, with their RED metrics
   search_traces      — Search traces by free-form filter + shortcut params
   aggregate_traces   — Aggregate traces (count/p99/avg/...) grouped by field(s)
   get_trace_details  — Full span list for one trace ID
@@ -17,6 +17,11 @@ Tools:
   get_field_values   — Discover values for a specific field key
   list_alert_rules   — Alert rules + firing state
   get_health         — Connectivity check
+
+Fleet-operator surface:
+  execute_builder_query — Raw Query Builder v5 passthrough (the escape hatch)
+  fleet_health          — Per-service calls / error rate / p95, in one query
+  compare_windows       — Per-group delta between two windows
 
 Configuration:
   SIGNOZ_URL              — SigNoz base URL (default: http://localhost:8080)
@@ -419,18 +424,131 @@ def _parse_aggregate(body: dict, request_type: str) -> list[dict]:
     return [{"labels": labels, "values": values} for labels, values in _iter_agg_series(body)]
 
 
+# ── Empty-log-store distinguisher (vikunja#926) ───────────────────────────────
+
+# Contexts that only exist once something has actually been INGESTED. SigNoz always
+# reports its built-in log schema — `body`, `severity_number`, `scope_name` and so on,
+# at fieldContext 'log' and 'scope' — whether or not a single log line has ever
+# arrived. Resource and attribute keys are different: they are derived from the data.
+#
+# MEASURED ON FORGE, 2026-09-20, against SigNoz v0.118.0:
+#
+#   signal    total keys    contexts                                  resource|attribute
+#   logs               8    {log: 6, scope: 2}                                         0
+#   traces           181    {attribute: 136, resource: 21, span: 23, scope: 2}       156
+#   metrics           64    {attribute: 47, resource: 21, metric: 1}                  63
+#
+# This matters because the obvious form of this check does NOT work. The plan for this
+# build proposed testing whether the logs signal has any field keys at all and treating
+# empty as the signal — but the payload is not empty on an empty store, it holds those
+# eight built-ins. A guard written that way would never once have fired.
+_DERIVED_FIELD_CONTEXTS = frozenset({"resource", "attribute"})
+
+
+async def _logs_signal_has_ingested_data() -> bool:
+    """True if the logs signal carries any field key derived from real data."""
+    data = await client.get("/api/v1/fields/keys", params={"signal": "logs"})
+    payload = data.get("data", {}) if isinstance(data, dict) else {}
+    keys = payload.get("keys") or {}
+    return any(
+        defn.get("fieldContext") in _DERIVED_FIELD_CONTEXTS
+        for defns in keys.values()
+        if isinstance(defns, list)
+        for defn in defns
+        if isinstance(defn, dict)
+    )
+
+
+async def _raise_if_logs_signal_is_empty() -> None:
+    """Distinguish "no matching logs" from "this backend holds no logs at all".
+
+    Every log tool here returns `[]` for both, and an agent cannot tell them apart.
+    That ambiguity is what produced vikunja#909: parse errors were diagnosed against
+    a table that had nothing in it, so no filter expression could ever have worked.
+
+    Called only on the EMPTY path, so this costs one extra request exactly when the
+    result would otherwise have been uninformative — never on a successful query.
+    """
+    if await _logs_signal_has_ingested_data():
+        return  # genuinely no matching rows; the caller's empty list is the answer
+    raise ValueError(
+        "SigNoz holds no log data at all — this is not an empty result for your "
+        "query. The logs signal reports only SigNoz's built-in schema keys and no "
+        "resource or attribute keys, meaning nothing has ever been ingested. "
+        "Nothing on forge currently exports OTLP logs and the collector has no "
+        "filelog receiver: see vikunja#926. Narrowing or widening this query will "
+        "not help; trace-side tools (search_traces, aggregate_traces) are unaffected."
+    )
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 
+# Fields returned per service by POST /api/v1/services, in the order they are
+# presented. `dataWarning` is deliberately dropped: its only member is
+# `topLevelOps`, which includes SigNoz's synthetic "overflow_operation" entry and
+# is noise in a fleet listing. Everything here is SigNoz's own field name —
+# renaming them would invent a mapping this server would then have to keep true.
+_SERVICE_FIELDS = (
+    "serviceName",
+    "p99",
+    "avgDuration",
+    "numCalls",
+    "callRate",
+    "numErrors",
+    "errorRate",
+    "num4XX",
+    "fourXXRate",
+)
+
+
 @tool
-async def list_services() -> list[str]:
-    """List all service names registered in SigNoz.
+async def list_services(start: str = "-1h", end: str = "now") -> list[dict]:
+    """List services seen in SigNoz within a time window, with their RED metrics.
+
+    Args:
+        start: Window start — relative duration ('-24h', '-7d') or 'now'.
+        end:   Window end — same format. Defaults to 'now'.
 
     Returns:
-        List of service name strings.
+        One dict per service, each carrying SigNoz's own field names:
+        `serviceName`, `p99` and `avgDuration` (NANOSECONDS — verified against
+        `p99(duration_nano)` from the trace aggregate, same order of magnitude),
+        `numCalls`, `callRate`, `numErrors`, `errorRate`, `num4XX`, `fourXXRate`.
+
+        Note that `p99`/`avgDuration` are computed over each service's TOP-LEVEL
+        operations, not every span, so they do not match
+        `aggregate_traces(p99(duration_nano))` exactly. Measured 2026-09-20 the
+        two agree within ~7% for most services and diverge up to 2x for services
+        with deep span trees. Use `aggregate_traces` when you need all spans.
     """
-    data = await client.get("/api/v1/services/list")
-    return data if isinstance(data, list) else []
+    # vikunja#322. This used GET /api/v1/services/list, which takes NO time range
+    # and applies its own short implicit window. Measured live on 2026-09-20
+    # against SigNoz v0.118.0: that endpoint returned 16 services regardless of
+    # window, while this POST form returned 21 at 24h and 25 at 7d — set-identical
+    # to aggregate_traces(count, group_by=service.name) at BOTH windows. Nine
+    # services were missing over 7 days, including scoped-mcp-doc-health and
+    # memsearch-summarize.
+    #
+    # `start` and `end` MUST be JSON STRINGS of nanoseconds. Passing numbers
+    # returns 400 "json: cannot unmarshal number into Go struct field
+    # GetServicesParams.start of type string" — confirmed live, do not
+    # rediscover it.
+    start_ms = _parse_time_ms(start)
+    end_ms = _parse_time_ms(end)
+    data = await client.post(
+        "/api/v1/services",
+        {
+            "start": str(start_ms * 1_000_000),
+            "end": str(end_ms * 1_000_000),
+            "tags": [],
+        },
+    )
+    if not isinstance(data, list):
+        return []
+    return [
+        {k: svc[k] for k in _SERVICE_FIELDS if k in svc} for svc in data if isinstance(svc, dict)
+    ]
 
 
 @tool
@@ -615,29 +733,37 @@ async def get_trace_details(
 
 @tool
 async def tail_logs(
-    service: str,
     severity: str = "ERROR",
     start: str = "-1h",
     end: str = "now",
     limit: int = 50,
 ) -> list[dict]:
-    """Return recent logs filtered by severity.
+    """Return the most recent logs at a given severity, newest first.
 
     Args:
-        service:  Service name (validated; recorded for context — see note).
         severity: Log severity level, e.g. 'ERROR', 'WARN', 'INFO'. Case-insensitive.
         start:    Start time, e.g. '-1h'. end: end time (default 'now').
         limit:    Max log lines to return (max 500).
 
-    Note:
-        In forge's v5 log schema, service name is a resource attribute that is not
-        reliably filterable in the log filter parser, so this tool filters on
-        severity_text only. Use search_logs(filter=...) for richer log filtering.
-
     Returns:
         List of log dicts with timestamp, severity_text, body, and resource fields.
+
+    To scope by service, use `search_logs(filter=...)` — but see vikunja#926 first:
+    no service on forge currently exports OTLP logs, so the log store is empty and
+    no service-scoping filter can be verified against real data today.
     """
-    _validate_service(service)
+    # vikunja#927. This took a REQUIRED `service` argument, validated it at the top
+    # of the body, and then never referenced it again — the spec below filtered on
+    # severity_text alone. Callers got a plausible-looking answer that had silently
+    # ignored the one thing they asked to narrow by.
+    #
+    # The parameter is DROPPED rather than wired into the filter. Scoping it properly
+    # means choosing a filter key, and the two log tools in this file already
+    # disagree about which key that is (see the note in search_logs). With the log
+    # store empty, either choice is a guess that cannot be tested — and this tool is
+    # already the result of one guess that got written into a docstring as though it
+    # were a design decision. Picking the key belongs to the build that fixes #926,
+    # where get_field_keys(signal="logs") will finally return data-derived keys.
     sev = _validate_severity(severity)
     start_ms = _parse_time_ms(start)
     end_ms = _parse_time_ms(end)
@@ -649,7 +775,10 @@ async def tail_logs(
         "limit": limit,
     }
     body = await client.query("logs", "raw", spec, start_ms, end_ms)
-    return _extract_rows(body)[:limit]
+    rows = _extract_rows(body)[:limit]
+    if not rows:
+        await _raise_if_logs_signal_is_empty()
+    return rows
 
 
 @tool
@@ -667,9 +796,9 @@ async def search_logs(
 
     Args:
         filter:      Free-form SigNoz filter expression, AND-combined with shortcuts.
-        service:     Shortcut for "service.name = '<service>'". Note: forge's log
-                     pipeline may not index service.name as filterable — this can
-                     return a parse error; prefer narrowing by time + severity.
+        service:     Shortcut for "service.name = '<service>'". UNVERIFIED — see the
+                     note in the body about vikunja#926; this may return a parse
+                     error. Prefer narrowing by time + severity until logs exist.
         severity:    Shortcut for "severity_text = '<SEVERITY>'".
         search_text: Shortcut for "body CONTAINS '<text>'" (log body substring).
         start:       Start time (default '-1h'). end: end time (default 'now').
@@ -678,6 +807,16 @@ async def search_logs(
     Returns:
         List of log dicts (timestamp, severity_text, body, resource fields, ...).
     """
+    # WHICH KEY NAMES A SERVICE IN THE LOGS SIGNAL IS UNRESOLVED (vikunja#926).
+    # This function emits `service.name`. aggregate_logs' docstring recommends
+    # `resource.service.name` while its own body also emits `service.name`, so the
+    # two tools — and one of them internally — disagree. They cannot all be right.
+    #
+    # Deliberately NOT resolved here. get_field_keys(signal="logs") returns only
+    # SigNoz's built-in schema and no resource keys at all, because nothing has ever
+    # been ingested, so picking a key now would be a guess dressed as a decision —
+    # which is exactly how vikunja#927 happened one tool over. The correction belongs
+    # to the build that fixes ingestion, where the field keys will finally say.
     parts: list[str] = []
     if filter:
         parts.append(_validate_filter_expr(filter))
@@ -704,7 +843,10 @@ async def search_logs(
         spec["filter"] = {"expression": " AND ".join(parts)}
 
     body = await client.query("logs", "raw", spec, start_ms, end_ms)
-    return _extract_rows(body)[:limit]
+    rows = _extract_rows(body)[:limit]
+    if not rows:
+        await _raise_if_logs_signal_is_empty()
+    return rows
 
 
 @tool
@@ -1019,6 +1161,387 @@ _TOOL_NAMES = (
     "list_alert_rules",
     "get_health",
 )
+
+
+# ── Fleet-operator surface ────────────────────────────────────────────────────
+
+
+def _scalar_results(body: dict) -> list[dict]:
+    """Parse a multi-aggregation scalar response into dicts keyed by column name."""
+    return _parse_scalar_rows(body)
+
+
+@tool
+async def execute_builder_query(
+    signal: str,
+    request_type: str,
+    spec: dict,
+    start: str = "-1h",
+    end: str = "now",
+) -> dict:
+    """Run a raw SigNoz Query Builder v5 spec. The escape hatch.
+
+    Every other tool here is a wrapper, and vikunja#322 is what a wrong wrapper
+    costs: `list_services` called an endpoint that silently under-reported, and
+    callers had no way through. This is the way through — if a tool's shape is
+    wrong for your question, build the spec yourself rather than working around it.
+
+    Args:
+        signal:       'traces', 'logs' or 'metrics'.
+        request_type: 'scalar' or 'time_series'.
+        spec:         The builder_query spec body — `aggregations`, `groupBy`,
+                      `filter`, `order`, `limit`, `offset`. `name`, `signal` and
+                      `disabled` are supplied for you. `limit` is clamped to
+                      1..10,000 and `offset` to >= 0, the same ceilings the
+                      wrapper tools apply — the escape hatch is from this server's
+                      tool SHAPES, not from its limits.
+        start/end:    Window, e.g. '-24h' / 'now'.
+
+    Returns:
+        The parsed SigNoz response body, unmodified. Parsing it is the caller's
+        job — that is the point of a passthrough. `_parse_scalar_rows`-shaped
+        output is available from `aggregate_traces` if you want it done for you.
+
+    Example — reproduce the 7d service list from first principles:
+        execute_builder_query(
+            signal="traces", request_type="scalar", start="-168h",
+            spec={"aggregations": [{"expression": "count()"}],
+                  "groupBy": [{"name": "service.name"}], "limit": 1000},
+        )
+    """
+    sig = _validate_signal(signal)
+    req_type = request_type.lower()
+    if req_type not in _ALLOWED_REQUEST_TYPES:
+        raise ValueError(f"request_type must be one of {sorted(_ALLOWED_REQUEST_TYPES)}")
+    if not isinstance(spec, dict):
+        raise ValueError("spec must be a dict")
+
+    # THE ALLOWLISTS STILL APPLY. A passthrough is an escape hatch from this
+    # server's TOOL SHAPES, not from its input validation — that distinction is the
+    # whole reason this is safe to add.
+    #
+    # THE SET OF POSITIONS BELOW WAS MEASURED, NOT INFERRED FROM THE WRAPPERS.
+    # Enumerating only the fields the wrapper tools emit gives a NARROWER set than
+    # the API accepts, and the gap is silent. Probed live against SigNoz v0.118.0 on
+    # 2026-09-20 by POSTing each candidate field and reading the status:
+    #
+    #   having.expression                     200  <- accepted, free-form expression
+    #   secondaryAggregations[].expression    200  <- accepted, free-form expression
+    #   secondaryAggregations[].groupBy[]     200  <- accepted, field names
+    #   selectFields[].name                   200  <- accepted, field names
+    #   functions[]                           200  <- accepted, but {name, args} only
+    #   filter as a bare string               400  <- rejected by SigNoz itself
+    #
+    # None of those is emitted by any tool in this file, so all four were reachable
+    # and unvalidated. SigNoz does check `having` server-side (the backtick probe
+    # came back 400 "Invalid references"), but that is SigNoz's defence, not this
+    # server's, and relying on it would make our guard depend on a backend version.
+    safe_spec = dict(spec)
+
+    def _check_expression_holder(obj: object) -> None:
+        """Validate an {"expression": "..."} node, wherever it appears."""
+        if isinstance(obj, dict) and isinstance(obj.get("expression"), str):
+            _validate_filter_expr(obj["expression"])
+
+    def _check_field_names(entries: object, what: str) -> None:
+        """Validate a list of {"name": "..."} field-name nodes."""
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                _validate_field_name(entry["name"], what)
+
+    # Free-form expression positions.
+    filt = safe_spec.get("filter")
+    if isinstance(filt, dict) and isinstance(filt.get("expression"), str):
+        safe_spec["filter"] = {**filt, "expression": _validate_filter_expr(filt["expression"])}
+    elif isinstance(filt, str):
+        # SigNoz rejects a bare string here (400), but normalising it is kinder than
+        # forwarding something we know will fail — and it must still be validated.
+        safe_spec["filter"] = {"expression": _validate_filter_expr(filt)}
+
+    _check_expression_holder(safe_spec.get("having"))
+
+    aggs = safe_spec.get("aggregations")
+    if isinstance(aggs, list):
+        for agg in aggs:
+            _check_expression_holder(agg)
+
+    secondary = safe_spec.get("secondaryAggregations")
+    if isinstance(secondary, list):
+        for agg in secondary:
+            _check_expression_holder(agg)
+            if isinstance(agg, dict):
+                _check_field_names(agg.get("groupBy"), "secondaryAggregations groupBy field")
+
+    # Plain field-name positions get the STRICTER check.
+    _check_field_names(safe_spec.get("groupBy"), "groupBy field")
+    _check_field_names(safe_spec.get("selectFields"), "selectFields field")
+
+    # order keys are NOT plain field names — `_build_order` deliberately sends the
+    # aggregation expression there ({"key": {"name": "count()"}}), and fleet_health
+    # above does the same. So they get the filter-expression allowlist, which permits
+    # parens, exactly as `_build_order` does. Using `_validate_field_name` here looks
+    # tighter and would reject this tool's own documented example.
+    order = safe_spec.get("order")
+    if isinstance(order, list):
+        for entry in order:
+            if not isinstance(entry, dict):
+                continue
+            nested = entry.get("key")
+            if isinstance(nested, dict) and isinstance(nested.get("name"), str):
+                _validate_filter_expr(nested["name"])
+            elif isinstance(entry.get("name"), str):
+                _validate_filter_expr(entry["name"])
+
+    # NUMERIC BOUNDS APPLY TOO. Security audit F-01
+    # (signoz-mcp-standard-defects-2026-09): every other tool in this file clamps
+    # `limit` before building its spec, and this one forwarded whatever the caller
+    # put in the dict. That was the same asymmetry the expression/field-name
+    # validation above exists to close — just in a position that is not a string, so
+    # the pass that found those did not look at it.
+    #
+    # _MAX_LIMIT_AGG rather than _MAX_LIMIT_RAW because request_type is validated
+    # against {"scalar", "time_series"} above; the raw path is not reachable here.
+    #
+    # Read-only backend, so the concern is cost and response size, not data access —
+    # but "the allowlists still apply" is this tool's entire justification for
+    # existing, and a ceiling that applies everywhere except the escape hatch is not
+    # a ceiling.
+    # REJECT, do not coerce. `int()` happily accepts 1.5, "250" and True, so the
+    # previous `int(...)` guard silently CHANGED those values while its error message
+    # promised it required an integer. A clamp that rewrites input it should have
+    # refused is the same defect as one that refuses input it should have accepted.
+    #
+    # `bool` is excluded explicitly because `isinstance(True, int)` is True in Python
+    # — `{"limit": True}` would otherwise sail through and become 1.
+    def _require_int(name: str, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"spec[{name!r}] must be an integer, got {type(value).__name__}")
+        return value
+
+    if "limit" in safe_spec:
+        safe_spec["limit"] = min(max(_require_int("limit", safe_spec["limit"]), 1), _MAX_LIMIT_AGG)
+    if "offset" in safe_spec:
+        safe_spec["offset"] = max(_require_int("offset", safe_spec["offset"]), 0)
+
+    # These are set by _build_query_payload; a caller overriding them would be
+    # reaching past the passthrough into the envelope.
+    for reserved in ("name", "signal", "disabled"):
+        safe_spec.pop(reserved, None)
+
+    start_ms = _parse_time_ms(start)
+    end_ms = _parse_time_ms(end)
+    return await client.query(sig, req_type, safe_spec, start_ms, end_ms)
+
+
+@tool
+async def fleet_health(start: str = "-1h", end: str = "now", limit: int = 1000) -> list[dict]:
+    """Per-service call count, error rate and p95 latency — the first question.
+
+    Composing this from aggregate_traces takes three or four calls. This is ONE,
+    which also means every column comes from the same scan over the same spans:
+    `count()`, `p95(duration_nano)` and `countIf(has_error = true)` are requested
+    as three aggregations on a single query.
+
+    That consistency is deliberate. `list_services` also returns per-service RED
+    metrics, but its `p99`/`avgDuration` cover each service's TOP-LEVEL operations
+    only — mixing the two sources would put two different scopes in adjacent
+    columns of the same row.
+
+    Args:
+        start/end: Window, e.g. '-24h' / 'now'.
+        limit:     Max services (max 10000).
+
+    Returns:
+        One dict per service, busiest first:
+        `service`, `calls`, `errors`, `error_rate` (0.0-1.0, `errors/calls`),
+        `p95_nano` (raw, as SigNoz returns it) and `p95_ms` (the same value / 1e6,
+        rounded to 3dp — a stated derivation, not a separate measurement).
+    """
+    start_ms = _parse_time_ms(start)
+    end_ms = _parse_time_ms(end)
+    spec = {
+        "aggregations": [
+            {"expression": "count()"},
+            {"expression": "p95(duration_nano)"},
+            {"expression": "countIf(has_error = true)"},
+        ],
+        "groupBy": _build_group_by("service.name"),
+        "order": [{"key": {"name": "count()"}, "direction": "desc"}],
+        "limit": min(max(limit, 1), _MAX_LIMIT_AGG),
+    }
+    body = await client.query("traces", "scalar", spec, start_ms, end_ms)
+
+    rows: list[dict] = []
+    for row in _scalar_results(body):
+        service = row.get("service.name")
+        if not service:
+            continue
+        calls = row.get("__result_0") or 0
+        p95_nano = row.get("__result_1") or 0
+        errors = row.get("__result_2") or 0
+        rows.append(
+            {
+                "service": service,
+                "calls": calls,
+                "errors": errors,
+                # Guarded rather than assumed non-zero: a group can only exist if it
+                # has spans, but a future filter could make that untrue silently.
+                "error_rate": round(errors / calls, 6) if calls else 0.0,
+                "p95_nano": p95_nano,
+                "p95_ms": round(p95_nano / 1_000_000, 3),
+            }
+        )
+    rows.sort(key=lambda r: -r["calls"])
+    return rows
+
+
+@tool
+async def compare_windows(
+    window_a: str,
+    window_b: str,
+    aggregation: str = "count",
+    aggregate_on: str = "",
+    group_by: str = "service.name",
+    filter: str = "",
+    limit: int = 1000,
+) -> list[dict]:
+    """Per-group delta between two time windows — "what changed since the deploy".
+
+    A raw count is a stock, not a flow. The operator question is almost never "how
+    many errors are there" but "are there more than before", and answering that by
+    eye from two separate tool calls is where the mistake gets made.
+
+    Args:
+        window_a:     The EARLIER/baseline window, e.g. '-48h'. Runs from
+                      window_a to window_b.
+        window_b:     The boundary between the two windows, e.g. '-24h'. The
+                      recent window runs from window_b to now.
+        aggregation:  count, count_distinct, avg, sum, min, max, p50-p99, rate.
+        aggregate_on: Field to aggregate (required unless count/rate).
+        group_by:     Comma-separated fields. Defaults to 'service.name'; use
+                      'name' for per-span-name, or 'service.name,name' for both.
+        filter:       Free-form filter expression applied to BOTH windows.
+        limit:        Max groups per window.
+
+    Returns:
+        One dict per group, largest absolute change first:
+        `<group field(s)>`, `before`, `after`, `delta` (after - before), and
+        `pct_change` (None when `before` is 0 — a new group has no percentage
+        change, and reporting one as 0 or infinity would be a fabricated number).
+
+        Groups present in only one window ARE included, with 0 for the side they
+        are missing from. Those are usually the interesting rows — a service that
+        stopped reporting is exactly what this is for — and dropping them to make
+        the join tidy would hide the finding.
+
+        **`before`/`after` can be `None`, and that is not the same as 0.** Each
+        window is capped at `limit` groups independently, so a group can be absent
+        from one window because it ranked below that window's cut rather than
+        because it was gone. When that window hit the cap, the missing side is
+        reported as `None` — unknown — and `delta`/`pct_change` are `None` too,
+        rather than a difference computed against a zero nobody measured. Rows with
+        an unknown delta sort last. Raise `limit` to resolve them.
+    """
+    agg_expr = _build_agg_expression(aggregation, aggregate_on)
+    group_keys = _build_group_by(group_by)
+    if not group_keys:
+        raise ValueError("group_by must name at least one field")
+    group_names = [k["name"] for k in group_keys]
+    # CEILING IS _MAX_LIMIT_AGG - 1, AND THE -1 IS LOAD-BEARING.
+    #
+    # The truncation detection below asks the backend for `limit + 1` and treats
+    # "got more than limit" as proof there was more. A naive
+    # `fetch_limit = min(limit + 1, _MAX_LIMIT_AGG)` collapses to `limit` at the
+    # maximum, so at most `limit` rows can come back and `len(out) > limit` is
+    # ALWAYS FALSE — the guard is silently dead at exactly the value where a window
+    # is most likely to be truncated, and the fabricated-disappearance bug it exists
+    # to prevent comes straight back.
+    #
+    # Reserving the slot costs one group at the ceiling and keeps the detector alive
+    # at every reachable limit. Found by CodeRabbit on the remediation commit itself.
+    limit = min(max(limit, 1), _MAX_LIMIT_AGG - 1)
+
+    # OVER-FETCH BY ONE, so truncation is a FACT rather than a suspicion.
+    #
+    # Each window is queried independently with the same `limit`, ordered by the
+    # aggregation descending. If a window has more groups than `limit`, the ones below
+    # the cut are simply absent from that window's response — and the naive join below
+    # used to read an absence as a zero, which reports a group that merely ranked low
+    # as having VANISHED (or, on the other side, as brand new). That is a fabricated
+    # finding in the one tool whose whole job is telling you what changed.
+    #
+    # Asking for `limit + 1` makes the test exact: getting `limit + 1` rows back proves
+    # there was at least one more, whereas "returned exactly `limit`" is ambiguous —
+    # a window with exactly `limit` groups is complete and indistinguishable from a
+    # truncated one. The extra row is then discarded, so `limit` keeps meaning what it
+    # says.
+    fetch_limit = limit + 1  # always reachable: limit is capped at _MAX_LIMIT_AGG - 1
+    spec: dict = {
+        "aggregations": [{"expression": agg_expr}],
+        "groupBy": group_keys,
+        "order": _build_order("", agg_expr),
+        "limit": fetch_limit,
+    }
+    if filter:
+        spec["filter"] = {"expression": _validate_filter_expr(filter)}
+
+    a_start, a_end = _parse_time_ms(window_a), _parse_time_ms(window_b)
+    b_start, b_end = _parse_time_ms(window_b), _parse_time_ms("now")
+    if a_start >= a_end:
+        raise ValueError(
+            f"window_a ({window_a}) must be earlier than window_b ({window_b}) — "
+            "the baseline window runs from window_a to window_b"
+        )
+
+    before_body = await client.query("traces", "scalar", spec, a_start, a_end)
+    after_body = await client.query("traces", "scalar", spec, b_start, b_end)
+
+    def keyed(body: dict) -> tuple[dict[tuple, float], bool]:
+        """Group values in response order, plus whether the window was truncated."""
+        out: dict[tuple, float] = {}
+        for row in _scalar_results(body):
+            key = tuple(row.get(n) for n in group_names)
+            if any(k is None for k in key):
+                continue
+            out[key] = row.get("__result_0") or 0
+        truncated = len(out) > limit
+        if truncated:
+            # Rows arrive ordered by the aggregation descending, so the tail is the
+            # part below the cut. Drop it to honour `limit`.
+            out = dict(list(out.items())[:limit])
+        return out, truncated
+
+    before, before_truncated = keyed(before_body)
+    after, after_truncated = keyed(after_body)
+
+    def side(values: dict[tuple, float], key: tuple, truncated: bool) -> float | None:
+        """A group's value, or None when its absence cannot be distinguished from
+        having fallen below a truncated window's limit."""
+        if key in values:
+            return values[key]
+        return None if truncated else 0
+
+    rows: list[dict] = []
+    for key in before.keys() | after.keys():
+        b = side(before, key, before_truncated)
+        a = side(after, key, after_truncated)
+        row = dict(zip(group_names, key, strict=False))
+        row["before"] = b
+        row["after"] = a
+        # None propagates deliberately. "I don't know what this was" must not be
+        # arithmetic'd into a delta that looks measured.
+        row["delta"] = None if b is None or a is None else a - b
+        row["pct_change"] = (
+            round((a - b) / b * 100, 2) if b not in (None, 0) and a is not None else None
+        )
+        rows.append(row)
+
+    # Unknown deltas sort last: they cannot be ranked against measured ones, and
+    # putting them first would give an unmeasurable row top billing.
+    rows.sort(key=lambda r: (r["delta"] is None, -abs(r["delta"] or 0)))
+    return rows
 
 
 def main() -> None:

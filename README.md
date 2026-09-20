@@ -1,5 +1,8 @@
 # signoz-mcp
 
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-6B57FF?logo=claude&logoColor=white)](https://claude.ai/code)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 FastMCP Python MCP server for SigNoz observability queries. Gives agents read-only
 access to services, traces, logs, metrics, and alert rules via the SigNoz HTTP API.
 Targets the SigNoz **v5** query API (v0.118+).
@@ -8,11 +11,11 @@ Targets the SigNoz **v5** query API (v0.118+).
 
 | Tool | Description |
 |------|-------------|
-| `list_services` | All registered service names — returns `list[str]` |
+| `list_services` | Services seen in a time window, with their RED metrics — returns `list[dict]` (`serviceName`, `p99`, `avgDuration`, `numCalls`, `callRate`, `numErrors`, `errorRate`, `num4XX`, `fourXXRate`). Takes `start`/`end` |
 | `search_traces` | Search traces by a free-form filter expression + shortcut params (service, operation, error, duration bounds) |
 | `aggregate_traces` | Aggregate traces (count/count_distinct/avg/sum/min/max/p50–p99/rate) grouped by field(s); scalar or time_series |
 | `get_trace_details` | Every span in a trace (`include_spans=True`) or a one-row trace summary |
-| `tail_logs` | Recent logs filtered by severity |
+| `tail_logs` | Most recent logs at a severity, newest first. No `service` parameter — see [vikunja#926](#logs) |
 | `search_logs` | Search logs by a free-form filter expression + shortcut params (service, severity, body search) |
 | `aggregate_logs` | Aggregate logs grouped by field(s); scalar or time_series |
 | `query_metric` | Named metric time series with an optional label filter |
@@ -21,6 +24,14 @@ Targets the SigNoz **v5** query API (v0.118+).
 | `get_field_values` | Discover values for a specific field key |
 | `list_alert_rules` | Alert rules and current firing state |
 | `get_health` | Connectivity check |
+
+### Fleet-operator surface
+
+| Tool | Description |
+|------|-------------|
+| `execute_builder_query` | Raw SigNoz Query Builder v5 passthrough — the escape hatch when a wrapper's shape is wrong for your question |
+| `fleet_health` | Per-service `calls`, `errors`, `error_rate`, `p95_nano`/`p95_ms` — **one** query, so every column comes from the same scan |
+| `compare_windows` | Per-group delta between two windows — `before`, `after`, `delta`, `pct_change`. Answers "what changed since the deploy" |
 
 All tools are read-only — the server never exposes SigNoz write endpoints.
 
@@ -72,3 +83,47 @@ pytest --cov=signoz_mcp --cov-report=term-missing
 ruff check .
 ruff format .
 ```
+
+## Logs
+
+**The log tools currently raise rather than return `[]`.** Nothing on forge exports OTLP
+logs and the collector has no `filelog` receiver, so SigNoz's log store is empty —
+measured 0 rows at `-720h`, while `get_health()` and `aggregate_traces` both pass as
+controls (vikunja#926).
+
+Rather than return an empty list that an agent would read as "no matching logs",
+`tail_logs` and `search_logs` detect the no-data-at-all case and raise a message naming
+the ticket. The distinguisher is that the logs signal reports **only SigNoz's built-in
+schema keys** (`fieldContext` `log`/`scope`) and none derived from ingested data
+(`resource`/`attribute`). Note that the field-keys payload is *not* empty on an empty
+store — it holds eight built-ins — so a check written against emptiness would never fire.
+
+`tail_logs` takes no `service` argument. It previously accepted one, validated it, and
+then filtered on severity alone (vikunja#927). Which key names a service in the logs
+signal is still unresolved — `search_logs` emits `service.name`, `aggregate_logs`'
+docstring recommends `resource.service.name` — and it cannot be settled until there is
+log data to test against. Trace-side tools are unaffected.
+
+## Per-tool latency, without a new tool
+
+Agents on forge emit `tool.<name>` spans, and per-tool latency is usually the actionable
+unit rather than per-service. `group_by` already reaches it — no separate tool:
+
+```python
+# Which tool calls are slowest, across the fleet?
+aggregate_traces(
+    aggregation="p95", aggregate_on="duration_nano", group_by="service.name,name", start="-168h"
+)
+
+# Did a specific tool get slower since yesterday?
+compare_windows(
+    window_a="-48h",
+    window_b="-24h",
+    aggregation="p95",
+    aggregate_on="duration_nano",
+    group_by="name",
+    filter="service.name = 'scoped-mcp-developer'",
+)
+```
+
+`name` is the span name; `service.name,name` groups by both.

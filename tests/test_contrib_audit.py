@@ -1,4 +1,4 @@
-"""Tests for signoz_mcp/contrib/audit_log.py."""
+"""Tests for src/signoz_mcp/contrib/audit_log.py."""
 
 from __future__ import annotations
 

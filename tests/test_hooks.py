@@ -1,4 +1,4 @@
-"""Tests for signoz_mcp/hooks.py and the server.instrument hook wiring."""
+"""Tests for src/signoz_mcp/hooks.py and the server.instrument hook wiring."""
 
 from __future__ import annotations
 
@@ -93,8 +93,8 @@ async def test_no_hooks_passthrough():
 @pytest.mark.asyncio
 @respx.mock
 async def test_before_hook_fires_on_instrumented_tool():
-    respx.get("http://localhost:8080/api/v1/services/list").mock(
-        return_value=Response(200, json=["svc"])
+    respx.post("http://localhost:8080/api/v1/services").mock(
+        return_value=Response(200, json=[{"serviceName": "svc", "numCalls": 1}])
     )
     fired = {}
 
@@ -112,8 +112,8 @@ async def test_before_hook_fires_on_instrumented_tool():
 @pytest.mark.asyncio
 @respx.mock
 async def test_after_hook_transforms_tool_result():
-    respx.get("http://localhost:8080/api/v1/services/list").mock(
-        return_value=Response(200, json=["svc"])
+    respx.post("http://localhost:8080/api/v1/services").mock(
+        return_value=Response(200, json=[{"serviceName": "svc", "numCalls": 1}])
     )
 
     async def wrap(result):
@@ -123,7 +123,7 @@ async def test_after_hook_transforms_tool_result():
     from signoz_mcp.server import list_services
 
     result = await list_services()
-    assert result == {"wrapped": ["svc"]}
+    assert result == {"wrapped": [{"serviceName": "svc", "numCalls": 1}]}
 
 
 @pytest.mark.asyncio
@@ -151,8 +151,8 @@ async def test_before_hook_mutation_reaches_upstream_call():
 @pytest.mark.asyncio
 @respx.mock
 async def test_before_hook_abort_prevents_upstream_call():
-    route = respx.get("http://localhost:8080/api/v1/services/list").mock(
-        return_value=Response(200, json=["svc"])
+    route = respx.post("http://localhost:8080/api/v1/services").mock(
+        return_value=Response(200, json=[{"serviceName": "svc", "numCalls": 1}])
     )
 
     async def boom(kwargs):

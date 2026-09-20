@@ -120,6 +120,30 @@ async def query(
     return resp.json()
 
 
+async def post(path: str, json_body: dict) -> dict | list:
+    """POST a JSON body to an arbitrary SigNoz API path and return the parsed body.
+
+    `query()` above is hardcoded to the query_range URL, so it cannot reach the
+    other POST endpoints. This exists for those — notably `/api/v1/services`,
+    which is the only way to get a time-bounded service list (vikunja#322).
+
+    Reuses `_check_response`, so the sanitized-error and never-leak-the-key
+    contract holds here exactly as it does for `query()` and `get()`. Returns
+    `dict | list` because SigNoz returns a bare JSON array from some endpoints.
+    """
+    url = f"{SIGNOZ_URL}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            resp = await client.post(url, headers=_HEADERS, json=json_body)
+    except httpx.TimeoutException as exc:
+        raise TimeoutError(f"SigNoz did not respond within {_HTTP_TIMEOUT}s") from exc
+    except httpx.ConnectError as exc:
+        raise ConnectionError(f"Could not connect to SigNoz at {SIGNOZ_URL}") from exc
+
+    _check_response(resp)
+    return resp.json()
+
+
 async def get(path: str, params: dict | None = None) -> dict:
     """GET a SigNoz API endpoint and return the parsed JSON body.
 

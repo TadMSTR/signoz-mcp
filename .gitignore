@@ -7,7 +7,23 @@ build/
 .coverage
 htmlcov/
 .pytest_cache/
+.ruff_cache/
 *.core
 core.*
 .env
 *.env
+
+# Private key material (B6). Distinct from the .env rules above: those catch
+# credentials written as environment files, these catch them written as keys.
+# A repo that is public on GitHub gets exactly one chance at this.
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Audit scratch directories — ci.yml copies each pylock export into its own
+# directory so pip-audit --locked cannot merge the two (see .github/workflows/ci.yml).
+.audit-runtime/
+.audit-dev/
+pylock.runtime.toml
+pylock.dev.toml
