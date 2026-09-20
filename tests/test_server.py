@@ -1500,3 +1500,118 @@ async def test_execute_builder_query_accepts_the_measured_fields_when_well_forme
     assert spec["having"] == {"expression": "count() > 1"}
     assert spec["selectFields"] == [{"name": "service.name"}]
     assert spec["secondaryAggregations"][0]["expression"] == "p95(duration_nano)"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compare_windows_does_not_fabricate_a_disappearance_when_truncated():
+    """A group below a truncated window's cut is UNKNOWN, not gone.
+
+    Each window is queried independently with the same limit. Before this was
+    handled, a group that merely ranked below `limit` in one window was joined
+    against a default of 0 and reported as a vanished service with a -100% change —
+    a fabricated finding in the one tool whose entire job is saying what changed.
+    """
+    # limit=2, so the tool asks for 3 to detect truncation. `before` returns 3 rows
+    # (truncated); `after` returns 2 (complete).
+    bodies = [
+        _v5_scalar(
+            ["service.name", "__result_0"],
+            [["big", 500], ["mid", 300], ["small", 100]],
+        ),
+        _v5_scalar(["service.name", "__result_0"], [["big", 400], ["mid", 350]]),
+    ]
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=bodies[len(captured) - 1])
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import compare_windows
+
+    rows = await compare_windows(window_a="-48h", window_b="-24h", limit=2)
+
+    # Over-fetch: limit + 1, so "returned exactly limit" is never ambiguous.
+    assert captured[0]["compositeQuery"]["queries"][0]["spec"]["limit"] == 3
+
+    by_service = {r["service.name"]: r for r in rows}
+
+    # `small` was trimmed from the truncated `before` side and is genuinely absent
+    # from `after`. It must NOT be reported as 100 -> 0.
+    assert "small" not in by_service, (
+        "a group trimmed from the truncated side leaked into the result"
+    )
+
+    # The complete side still yields real numbers.
+    assert by_service["big"]["before"] == 500
+    assert by_service["big"]["after"] == 400
+    assert by_service["big"]["delta"] == -100
+    assert by_service["mid"]["delta"] == 50
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compare_windows_reports_unknown_rather_than_zero_on_a_truncated_side():
+    """A group present only in the COMPLETE window, with the other side truncated."""
+    bodies = [
+        # before: truncated (3 rows for limit=2), and does not contain `newcomer`
+        _v5_scalar(
+            ["service.name", "__result_0"],
+            [["big", 500], ["mid", 300], ["small", 100]],
+        ),
+        # after: complete (2 rows), contains `newcomer`
+        _v5_scalar(["service.name", "__result_0"], [["big", 400], ["newcomer", 250]]),
+    ]
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=bodies[len(captured) - 1])
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import compare_windows
+
+    rows = await compare_windows(window_a="-48h", window_b="-24h", limit=2)
+    by_service = {r["service.name"]: r for r in rows}
+
+    # `newcomer` is absent from a TRUNCATED before-window. It may be new, or it may
+    # simply have ranked below the cut. The honest answer is "unknown", not 0.
+    n = by_service["newcomer"]
+    assert n["before"] is None, "a truncated side's absence must not be reported as 0"
+    assert n["after"] == 250
+    assert n["delta"] is None, "no delta can be computed against an unmeasured value"
+    assert n["pct_change"] is None
+
+    # Unknown deltas sort last — they cannot be ranked against measured ones.
+    assert rows[-1]["service.name"] == "newcomer"
+    assert by_service["big"]["delta"] == -100
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compare_windows_uses_zero_when_the_window_was_not_truncated():
+    """The other direction: a real disappearance must still be reported as one.
+
+    If the guard treated every absence as unknown it would destroy the tool's main
+    use case, so this pins that an UNtruncated window still yields 0 and a real delta.
+    """
+    bodies = [
+        _v5_scalar(["service.name", "__result_0"], [["steady", 100], ["gone", 50]]),
+        _v5_scalar(["service.name", "__result_0"], [["steady", 150]]),
+    ]
+    captured = []
+
+    def capture(request):
+        captured.append(json.loads(request.content))
+        return Response(200, json=bodies[len(captured) - 1])
+
+    respx.post("http://localhost:8080/api/v5/query_range").mock(side_effect=capture)
+    from signoz_mcp.server import compare_windows
+
+    rows = await compare_windows(window_a="-48h", window_b="-24h", limit=100)
+    by_service = {r["service.name"]: r for r in rows}
+
+    assert by_service["gone"]["after"] == 0, "neither window was truncated"
+    assert by_service["gone"]["delta"] == -50
+    assert by_service["gone"]["pct_change"] == -100.0

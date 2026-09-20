@@ -134,15 +134,25 @@ jobs:
       # No --audit-level widening and no blanket --ignore-vuln. A narrow, dated,
       # ticket-referenced ignore for one named advisory is the only sanctioned escape;
       # raising a threshold silently reclassifies every future finding below the new line.
+      # THE AUDIT TOOL IS PINNED TOO. `uv tool run pip-audit` infers the package from
+      # the command name and resolves it fresh into an ephemeral environment on every
+      # run — uv.lock does NOT constrain that environment, because pip-audit is not a
+      # project dependency. So the thing deciding whether this repo ships a vulnerable
+      # dependency was itself floating to latest.
+      #
+      # Same class as the unpinned `ruff` two commits ago, and worse in consequence: a
+      # formatter that changes its mind makes CI red, an audit tool that changes its
+      # mind can make CI GREEN. Bump deliberately, alongside the version in the
+      # comment on the gates above.
       - name: Audit runtime dependencies
         run: |
           mkdir -p .audit-runtime && cp pylock.runtime.toml .audit-runtime/pylock.toml
-          uv tool run pip-audit --strict --locked .audit-runtime
+          uv tool run --from "pip-audit==2.10.1" pip-audit --strict --locked .audit-runtime
 
       - name: Audit dev dependencies
         run: |
           mkdir -p .audit-dev && cp pylock.dev.toml .audit-dev/pylock.toml
-          uv tool run pip-audit --strict --locked .audit-dev
+          uv tool run --from "pip-audit==2.10.1" pip-audit --strict --locked .audit-dev
 
   build:
     name: Build distribution

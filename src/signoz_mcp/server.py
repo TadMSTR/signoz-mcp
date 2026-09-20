@@ -1401,6 +1401,14 @@ async def compare_windows(
         are missing from. Those are usually the interesting rows — a service that
         stopped reporting is exactly what this is for — and dropping them to make
         the join tidy would hide the finding.
+
+        **`before`/`after` can be `None`, and that is not the same as 0.** Each
+        window is capped at `limit` groups independently, so a group can be absent
+        from one window because it ranked below that window's cut rather than
+        because it was gone. When that window hit the cap, the missing side is
+        reported as `None` — unknown — and `delta`/`pct_change` are `None` too,
+        rather than a difference computed against a zero nobody measured. Rows with
+        an unknown delta sort last. Raise `limit` to resolve them.
     """
     agg_expr = _build_agg_expression(aggregation, aggregate_on)
     group_keys = _build_group_by(group_by)
@@ -1409,11 +1417,26 @@ async def compare_windows(
     group_names = [k["name"] for k in group_keys]
     limit = min(max(limit, 1), _MAX_LIMIT_AGG)
 
+    # OVER-FETCH BY ONE, so truncation is a FACT rather than a suspicion.
+    #
+    # Each window is queried independently with the same `limit`, ordered by the
+    # aggregation descending. If a window has more groups than `limit`, the ones below
+    # the cut are simply absent from that window's response — and the naive join below
+    # used to read an absence as a zero, which reports a group that merely ranked low
+    # as having VANISHED (or, on the other side, as brand new). That is a fabricated
+    # finding in the one tool whose whole job is telling you what changed.
+    #
+    # Asking for `limit + 1` makes the test exact: getting `limit + 1` rows back proves
+    # there was at least one more, whereas "returned exactly `limit`" is ambiguous —
+    # a window with exactly `limit` groups is complete and indistinguishable from a
+    # truncated one. The extra row is then discarded, so `limit` keeps meaning what it
+    # says.
+    fetch_limit = min(limit + 1, _MAX_LIMIT_AGG)
     spec: dict = {
         "aggregations": [{"expression": agg_expr}],
         "groupBy": group_keys,
         "order": _build_order("", agg_expr),
-        "limit": limit,
+        "limit": fetch_limit,
     }
     if filter:
         spec["filter"] = {"expression": _validate_filter_expr(filter)}
@@ -1429,29 +1452,49 @@ async def compare_windows(
     before_body = await client.query("traces", "scalar", spec, a_start, a_end)
     after_body = await client.query("traces", "scalar", spec, b_start, b_end)
 
-    def keyed(body: dict) -> dict[tuple, float]:
+    def keyed(body: dict) -> tuple[dict[tuple, float], bool]:
+        """Group values in response order, plus whether the window was truncated."""
         out: dict[tuple, float] = {}
         for row in _scalar_results(body):
             key = tuple(row.get(n) for n in group_names)
             if any(k is None for k in key):
                 continue
             out[key] = row.get("__result_0") or 0
-        return out
+        truncated = len(out) > limit
+        if truncated:
+            # Rows arrive ordered by the aggregation descending, so the tail is the
+            # part below the cut. Drop it to honour `limit`.
+            out = dict(list(out.items())[:limit])
+        return out, truncated
 
-    before, after = keyed(before_body), keyed(after_body)
+    before, before_truncated = keyed(before_body)
+    after, after_truncated = keyed(after_body)
+
+    def side(values: dict[tuple, float], key: tuple, truncated: bool) -> float | None:
+        """A group's value, or None when its absence cannot be distinguished from
+        having fallen below a truncated window's limit."""
+        if key in values:
+            return values[key]
+        return None if truncated else 0
 
     rows: list[dict] = []
     for key in before.keys() | after.keys():
-        b = before.get(key, 0)
-        a = after.get(key, 0)
+        b = side(before, key, before_truncated)
+        a = side(after, key, after_truncated)
         row = dict(zip(group_names, key, strict=False))
         row["before"] = b
         row["after"] = a
-        row["delta"] = a - b
-        row["pct_change"] = round((a - b) / b * 100, 2) if b else None
+        # None propagates deliberately. "I don't know what this was" must not be
+        # arithmetic'd into a delta that looks measured.
+        row["delta"] = None if b is None or a is None else a - b
+        row["pct_change"] = (
+            round((a - b) / b * 100, 2) if b not in (None, 0) and a is not None else None
+        )
         rows.append(row)
 
-    rows.sort(key=lambda r: -abs(r["delta"]))
+    # Unknown deltas sort last: they cannot be ranked against measured ones, and
+    # putting them first would give an unmeasurable row top billing.
+    rows.sort(key=lambda r: (r["delta"] is None, -abs(r["delta"] or 0)))
     return rows
 
 

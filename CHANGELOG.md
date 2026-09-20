@@ -59,6 +59,49 @@ MCP server does not provide. All trace-side, so none is blocked on #926.
   `group_by="name"` and `group_by="service.name,name"` already work. Documented in the
   README with two worked examples, both run against live SigNoz before being committed.
 
+### CodeRabbit review findings (PR #7)
+
+Five findings, all valid, all fixed. Two are notable for being the same class of defect
+this build had already fixed once — unpinned tooling — in places I had not looked.
+
+- **The gitleaks gate prover accepted any non-zero exit as "detected".** gitleaks uses `1`
+  for an operational error *and*, by default, `1` for a finding — so a scan that broke
+  before reading anything would have been reported as a working gate. A false-green inside
+  the probe written to prevent false-greens. Both the probe and the workflow now pass
+  `--exit-code 42`, and treat `1` as a scanner error. Measured against the pinned 8.28.0:
+  planted → 42, clean → 0, missing source → 1, malformed config → 1. Verified by running
+  the probe against a stub gitleaks that always exits 1 — it now fails, where before it
+  would have said "ok detected".
+- **`pip-audit` was unpinned.** `uv tool run pip-audit` resolves fresh on every run and
+  `uv.lock` does not constrain that environment, so the tool deciding whether this repo
+  ships a vulnerable dependency was itself floating to latest. Now
+  `--from "pip-audit==2.10.1"`. Worse in consequence than the `ruff` case below: a
+  formatter that changes its mind turns CI red, an audit tool that changes its mind can
+  turn it **green**.
+- **The gitleaks archive was downloaded without an integrity check.** Version pinned,
+  artefact not — and a release asset can be replaced under an existing tag. Now verified
+  against the SHA-256 published in `gitleaks_8.28.0_checksums.txt`, confirmed against an
+  independently downloaded copy, and checked *before* extraction so it fails closed.
+- **`AGENTS.md` still claimed a coverage threshold of 80%** after the floor was ratcheted
+  to 87 — the documentation encoding the old value, which is how a contributor validates
+  against the wrong requirement. Corrected, and pointed at `pyproject.toml` as the single
+  source of truth.
+- **`compare_windows` could fabricate a disappearance.** Each window is queried
+  independently with the same `limit`, ordered by the aggregation descending. A group
+  ranking below the cut in one window was absent from that window's response, and the join
+  filled the gap with `0` — reporting a service that merely ranked low as having
+  **vanished, with a -100% change**. A fabricated finding in the one tool whose entire job
+  is saying what changed.
+
+  Fixed by over-fetching `limit + 1`, which makes truncation a fact rather than a
+  suspicion — "returned exactly `limit`" is ambiguous, since a window with exactly `limit`
+  groups is complete and indistinguishable from a truncated one. When a window was
+  truncated, a missing group's side is reported as **`None` (unknown)** rather than `0`,
+  and `delta`/`pct_change` are `None` too rather than arithmetic against a value nobody
+  measured. Unknown deltas sort last. A control test pins that an **un**truncated window
+  still reports a real disappearance as `0` with a real delta — otherwise the guard would
+  have destroyed the tool's main use case.
+
 ### CI fixes found by the new gates themselves
 
 Both were caught on the PR's first CI run, by gates this build added. Recorded because

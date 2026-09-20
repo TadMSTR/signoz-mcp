@@ -121,7 +121,9 @@ pytest
 pytest --cov=signoz_mcp --cov-report=term-missing
 ```
 
-Tests use `respx` to mock the SigNoz HTTP API. No real network calls. Coverage threshold: 80%.
+Tests use `respx` to mock the SigNoz HTTP API for the unit suite. Coverage floor: **87%**, ratcheted — see the dated comment beside `fail_under` in `pyproject.toml`, which is the source of truth. Do not lower it to make a red build green.
+
+`tests/test_live_signoz.py` is the exception to "no real network calls": it runs against a REAL SigNoz and skips unless `SIGNOZ_LIVE=1`. It exists because a mocked test cannot assert a result is COMPLETE, which is what vikunja#322 was — and a SKIP there is not a PASS.
 
 ## Git workflow
 

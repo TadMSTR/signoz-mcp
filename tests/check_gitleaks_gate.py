@@ -9,7 +9,9 @@ green tick alone, which is how gates ship inert.
 So this runs the gate TWO-SIDED:
 
   planted  a synthetic credential is committed into a throwaway copy — gitleaks must
-           exit non-zero. This is the side that can actually fail.
+           exit with LEAK_EXIT specifically, NOT merely non-zero: gitleaks uses 1 for
+           an operational error, so "non-zero" would accept a scan that broke before
+           reading anything. This is the side that can actually fail.
   clean    the real working tree — gitleaks must exit zero, so a gate that simply
            fails on everything is not mistaken for a working one.
 
@@ -69,10 +71,33 @@ SKIP = shutil.ignore_patterns(
 )
 
 
+# A DISTINCT EXIT CODE FOR "FOUND SOMETHING", so it cannot be confused with "the
+# scanner broke". gitleaks exits 1 for an operational error and, by default, ALSO 1
+# for a finding — so an "any non-zero means it fired" check passes when the scan
+# errored before reading anything, which is the exact false-green this probe exists
+# to prevent. --exit-code moves findings off 1 and leaves 1 meaning error alone.
+#
+# MEASURED against the pinned 8.28.0, 2026-09-20:
+#   planted secret        -> 42
+#   clean tree            -> 0
+#   --source nonexistent  -> 1
+#   malformed --config    -> 1
+LEAK_EXIT = 42
+
+
 def run_gitleaks(source: Path) -> int:
-    """Exit code of a gitleaks scan over `source`. 0 = clean, non-zero = findings."""
+    """Exit code: 0 clean, LEAK_EXIT findings, anything else a scanner error."""
     return subprocess.run(
-        ["gitleaks", "detect", "--source", str(source), "--redact", "--no-banner"],
+        [
+            "gitleaks",
+            "detect",
+            "--source",
+            str(source),
+            "--redact",
+            "--no-banner",
+            "--exit-code",
+            str(LEAK_EXIT),
+        ],
         capture_output=True,
         text=True,
     ).returncode
@@ -96,17 +121,30 @@ def check_planted_fails() -> bool:
                 "its green result on the real tree means nothing."
             )
             return False
+        if code != LEAK_EXIT:
+            print(
+                f"FAIL  gitleaks exited {code}, not {LEAK_EXIT}. That is a scanner "
+                "ERROR, not a detection — the planted secret may never have been "
+                "read. Accepting any non-zero here would report a broken scan as a "
+                "working gate."
+            )
+            return False
         print(f"ok    planted secret detected (gitleaks exit {code})")
         return True
 
 
 def check_clean_passes() -> bool:
     code = run_gitleaks(REPO)
+    if code == LEAK_EXIT:
+        print(
+            f"FAIL  the real tree scans dirty (gitleaks exit {code}) — there is a "
+            "genuine finding to fix."
+        )
+        return False
     if code != 0:
         print(
-            f"FAIL  the real tree scans dirty (gitleaks exit {code}). Either there is "
-            "a genuine finding to fix, or the gate fails on everything and proves "
-            "nothing."
+            f"FAIL  gitleaks exited {code} on the real tree. That is a scanner error, "
+            "not a clean result — do not read it as one."
         )
         return False
     print("ok    real tree scans clean")
