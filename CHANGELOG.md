@@ -175,12 +175,14 @@ violation as well as pass on the clean tree:
 
 | Gate | Fails on | Passes on |
 |---|---|---|
-| gitleaks (B14) | synthetic PAT committed to a throwaway copy → exit 1 | real tree → exit 0 |
+| gitleaks (B14) | synthetic **high-entropy** PAT committed to a throwaway copy → exit 1 | real tree → exit 0 |
 | `uv lock --check` | a dependency added to `pyproject.toml` → exit 1 | in-sync lock → exit 0 |
 | `pip-audit --locked` | jinja2 2.11.3 planted in a lock copy → exit 1, 4 advisories | real runtime + dev locks → exit 0 |
 
 `tests/check_gitleaks_gate.py` runs the gitleaks half of that table in CI, before the
 clean result is believed.
+
+**It earned its keep on the first CI run.** The planted value was initially 36 repeated `A`s. gitleaks **8.28.0** — the version this repo pins — applies an entropy floor to its `github-pat` rule, so that string scores 0.67 and is ignored; the forge host's own `/usr/bin/gitleaks` (which reports `version is set by build process`) has no such floor and did report it. The probe therefore passed locally while the gate was **inert in CI**, and only the planted side caught it. The value now has real entropy (5.22), is assembled at runtime so this repo never contains a PAT-shaped literal, and the probe prints the gitleaks version so a local/CI skew is visible rather than silent.
 
 ### Deployment note
 

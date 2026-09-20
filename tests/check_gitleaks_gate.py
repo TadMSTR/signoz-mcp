@@ -33,13 +33,27 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# A synthetic GitHub PAT. Deliberately all-A's after the prefix: it matches gitleaks'
-# `github-pat` rule on shape, and it is self-evidently not a credential anyone could
-# use, so this file does not become the thing it is testing for. Do NOT replace this
-# with a real-looking random value and do NOT use a vendor's published example key —
-# gitleaks allowlists several of those by default, and the probe would silently pass
-# for the wrong reason.
-PLANTED = "ghp_" + "A" * 36
+# A synthetic GitHub PAT, assembled at runtime so that THIS FILE never contains a
+# PAT-shaped string. The body below is not a credential and the `ghp_` prefix is only
+# ever joined to it in memory, which is what keeps the clean-side scan honest: if the
+# literal lived here, the real tree would scan dirty and the probe would be testing
+# itself.
+#
+# THE BODY MUST HAVE REAL ENTROPY. This was originally 36 repeated 'A's, which read as
+# obviously-not-a-credential and was wrong for a reason worth recording:
+#
+#   gitleaks 8.28.0 (the version this repo pins) applies an ENTROPY FLOOR to the
+#   github-pat rule. Measured 2026-09-20: 'ghp_' + 'A'*36 scores 0.67 and is NOT
+#   reported, while the string below scores 5.22 and is. The forge host's own
+#   /usr/bin/gitleaks — which reports `version is set by build process` — has no such
+#   floor and DID report the all-A's value, so the probe passed locally and the gate
+#   shipped inert. CI caught it on the first run, which is the entire point of running
+#   the planted side at all.
+#
+# So: do not "simplify" this to a repeated character, and do not substitute a vendor's
+# published example key either — gitleaks allowlists several of those by default and
+# the probe would then pass for the wrong reason.
+PLANTED = "ghp_" + "x9Kq2mVb7TzR4nJ8pLw3sYd6HgF5cQa1BeN0"
 
 # Directories that are large, regenerable, and not part of what the gate protects.
 SKIP = shutil.ignore_patterns(
@@ -107,6 +121,12 @@ def main() -> int:
             "one that keeps credentials out of a PUBLIC repo."
         )
         return 1
+
+    # Print the version. The failure this probe was written against was a VERSION SKEW
+    # between the host binary and the pinned one, and a result with no version beside it
+    # cannot be compared to CI's.
+    version = subprocess.run(["gitleaks", "version"], capture_output=True, text=True).stdout.strip()
+    print(f"gitleaks version: {version or 'unknown'}")
 
     # Planted first. If the gate cannot fail, the clean result carries no information
     # and there is no point reporting it as reassurance.
