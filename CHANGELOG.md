@@ -102,6 +102,24 @@ is *requested* but whether a missing group on a truncated side returns `None` or
 fixes are now confirmed red against the pre-fix code, the ceiling one failing on
 `assert 0 is None` — the fabricated zero itself.
 
+### CodeRabbit round 3 (full review @ `34d6987`)
+
+One finding, in a test rather than shipped code — the trend across three rounds was
+**5 → 2 → 1**, and only this round's finding was not in production code.
+
+- **The live `compare_windows` test did not handle the `None` semantics this build
+  introduced.** `r["delta"] == r["after"] - r["before"]` raises `TypeError` on an unknown
+  side. It does not fire on forge today (~25 groups against a default `limit` of 1000),
+  which is precisely why it needed pinning rather than leaving to chance — it would have
+  failed the live suite for a reason unrelated to the contract under test. A counter was
+  added alongside the fix so the loop cannot silently assert nothing if every row happens
+  to have an unknown side.
+
+Note for future rounds: CodeRabbit is **incremental** and refuses a plain `@coderabbitai
+review` of a commit it considers already seen, replying *"Already reviewed the last
+commit."* That refusal is not a clean result. `@coderabbitai full review` is the documented
+override and is what produced this round.
+
 ### Security audit findings (signoz-mcp-standard-defects-2026-09)
 
 Clean audit — no Critical, High or Medium. Two Low, both remediated.

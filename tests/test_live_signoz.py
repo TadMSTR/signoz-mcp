@@ -204,10 +204,30 @@ async def test_fleet_health_agrees_with_an_independent_aggregate(server):
 async def test_compare_windows_deltas_are_internally_consistent(server):
     rows = await server.compare_windows(window_a="-48h", window_b="-24h")
     assert rows, "no groups over the last 48h"
+
+    # `before`/`after` are None when that window was truncated at `limit` — the
+    # value is unknown, not zero. Arithmetic on it raises TypeError, so an
+    # unguarded `after - before` would fail the live suite for a reason unrelated
+    # to the contract under test. Does not fire on forge today (~25 groups against
+    # a default limit of 1000), which is exactly why it needs pinning rather than
+    # leaving to chance.
+    checked = 0
     for r in rows:
+        if r["before"] is None or r["after"] is None:
+            assert r["delta"] is None, "an unknown side must not produce a delta"
+            assert r["pct_change"] is None
+            continue
+        checked += 1
         assert r["delta"] == r["after"] - r["before"]
         if r["before"] == 0:
             assert r["pct_change"] is None, (
                 "a group with no baseline has no percentage change; reporting one "
                 "would be a fabricated number"
             )
+
+    # Without this the loop above asserts nothing if every row happened to be
+    # unknown — a passing test that checked no arithmetic at all.
+    assert checked, (
+        "every group had an unknown side, so the delta arithmetic was never "
+        "exercised; raise `limit` or widen the window"
+    )
