@@ -4,7 +4,8 @@
 
 ### Fixed — supply-chain hygiene
 
-No runtime code changed; this is entirely `.github/`.
+No **application** runtime code changed. The diff is `.github/` plus one checker
+script under `tests/`.
 
 - **Dependabot could not keep `github/codeql-action` self-consistent.** It treats `init`,
   `analyze` and `upload-sarif` as three independent dependencies, so its first run raised
@@ -26,6 +27,15 @@ No runtime code changed; this is entirely `.github/`.
   no branch filter, so each branch push fired it once for the push and again for the PR —
   measured as two `gitleaks` check-runs on each of PRs #8-#12. Scoped to `branches: [main]`,
   matching `ci.yml`. The weekly full-history scan is unchanged.
+
+- **`tests/check_gitleaks_gate.py` printed reassurance after reporting it could not
+  fail.** `main()` collected `[check_planted_fails(), check_clean_passes()]` and only
+  then tested `all(...)`, so both ran unconditionally — a run where the planted secret
+  went undetected still printed `ok  real tree scans clean` underneath the failure. The
+  comment directly above it already said the clean result "carries no information and
+  there is no point reporting it as reassurance". Now returns on the first failure. Found
+  by CodeRabbit against the identical pattern in the new checker; fixed in both rather
+  than left as a known defect in the file next door.
 
 ### Added
 

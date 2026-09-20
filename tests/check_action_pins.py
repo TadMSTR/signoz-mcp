@@ -51,9 +51,19 @@ WORKFLOWS = REPO / ".github" / "workflows"
 # Horizontal whitespace only — `\s` matches newlines, so `^\s*` would happily start the
 # match on a blank line ABOVE the `uses:` and report a line number two off. A gate that
 # names the wrong line sends the reader to the wrong place, which is its own small lie.
+#
+# QUOTED SCALARS ARE MATCHED TOO. `uses: "owner/repo/sub@<sha>"` is ordinary YAML and
+# Actions reads it identically to the bare form. Nothing in this repo writes it that way
+# today, which is exactly why it is worth handling: a pin this pattern does not see is a
+# pin that can diverge without the gate noticing, and "no workflow uses that syntax" is a
+# fact about the present tree, not a property of the check. `(?(q)(?P=q))` is a
+# conditional backreference — it demands the SAME closing quote when an opening one was
+# matched, and demands nothing when it was not, so an unbalanced quote is not accepted as
+# a pin.
 USES = re.compile(
-    r"^[ \t]*(?:-[ \t]+)?uses:[ \t]*"
+    r"^[ \t]*(?:-[ \t]+)?uses:[ \t]*(?P<q>[\'\"])?"
     r"(?P<ref>[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+)@(?P<sha>[0-9a-f]{40})"
+    r"(?(q)(?P=q))"
     r"(?:[ \t]*#[ \t]*(?P<comment>.*?))?[ \t]*$",
     re.MULTILINE,
 )
@@ -107,11 +117,52 @@ def _report(divergent: dict[str, list[Pin]]) -> None:
             print(f"        {pin}")
 
 
+def _plant(group: str, target: Pin, quote: str) -> bool:
+    """Rewrite one pin in a throwaway copy and require find_divergence to report it.
+
+    `quote` is "" for the bare form and `'` or `"` for a YAML quoted scalar. Both are
+    exercised on every run: the quoted form is not used anywhere in this repo today, so
+    the only thing that would ever catch the pattern losing it is a probe that writes it
+    deliberately.
+    """
+    form = f"quoted with {quote}" if quote else "bare"
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / "workflows"
+        shutil.copytree(WORKFLOWS, work)
+
+        planted_file = work / target.file.name
+        before = planted_file.read_text()
+        after = before.replace(
+            f"{target.ref}@{target.sha}",
+            f"{quote}{target.ref}@{PLANTED_SHA}{quote}",
+            1,
+        )
+        if after == before:
+            print(
+                f"FAIL  could not plant a {form} divergence into {target.file.name} — "
+                "the substitution did not match, so this side never ran. Do not read "
+                "the clean side as a pass."
+            )
+            return False
+        planted_file.write_text(after)
+
+        divergent = find_divergence(work)
+        if group not in divergent:
+            print(
+                f"FAIL  planted a second commit for {group} in {target.file.name} "
+                f"({form}) and the checker did NOT report it. The gate cannot fail, so "
+                "its green result on the real tree means nothing."
+            )
+            return False
+
+    print(f"ok    planted divergence in {group} was detected ({form})")
+    return True
+
+
 def check_planted_fails() -> bool:
     """Plant a divergence in a copy and require the checker to find it."""
-    pins = collect_pins(WORKFLOWS)
     groups: dict[str, list[Pin]] = defaultdict(list)
-    for pin in pins:
+    for pin in collect_pins(WORKFLOWS):
         groups[pin.group].append(pin)
 
     # THE PLANT MUST BE ABLE TO LAND. A group with one member cannot diverge, so
@@ -129,33 +180,8 @@ def check_planted_fails() -> bool:
     group, victims = max(multi.items(), key=lambda kv: len(kv[1]))
     target = victims[1]  # the second occurrence; the first keeps the true SHA
 
-    with tempfile.TemporaryDirectory() as tmp:
-        work = Path(tmp) / "workflows"
-        shutil.copytree(WORKFLOWS, work)
-
-        planted_file = work / target.file.name
-        before = planted_file.read_text()
-        after = before.replace(f"{target.ref}@{target.sha}", f"{target.ref}@{PLANTED_SHA}", 1)
-        if after == before:
-            print(
-                f"FAIL  could not plant a divergence into {target.file.name} — the "
-                "substitution did not match, so the planted side never ran. Do not "
-                "read the clean side as a pass."
-            )
-            return False
-        planted_file.write_text(after)
-
-        divergent = find_divergence(work)
-        if group not in divergent:
-            print(
-                f"FAIL  planted a second commit for {group} in {target.file.name} and "
-                "the checker did NOT report it. The gate cannot fail, so its green "
-                "result on the real tree means nothing."
-            )
-            return False
-
-    print(f"ok    planted divergence in {group} was detected")
-    return True
+    # Every accepted spelling gets planted, not just the one the tree happens to use.
+    return all(_plant(group, target, q) for q in ("", '"', "'"))
 
 
 def check_real_tree_passes() -> bool:
@@ -188,10 +214,15 @@ def check_real_tree_passes() -> bool:
 
 
 def main() -> int:
-    # Planted first. If the gate cannot fail, the clean result is not reassurance and
-    # should not be printed as though it were.
-    results = [check_planted_fails(), check_real_tree_passes()]
-    if not all(results):
+    # Planted first, and RETURN before the clean check rather than collecting both
+    # results. Evaluating both would print `ok  N pins across M actions` even when the
+    # planted side had just reported that the gate cannot fail — which is the precise
+    # false reassurance this file exists to refuse. The comment said "should not be
+    # printed as though it were" while the code printed it anyway; CodeRabbit caught
+    # that on PR #13.
+    if not check_planted_fails():
+        return 1
+    if not check_real_tree_passes():
         return 1
     print("action-pin gate verified two-sided: it fails on a planted divergence and passes here.")
     return 0
