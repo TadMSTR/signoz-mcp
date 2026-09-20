@@ -19,10 +19,21 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+# BOUNDED RANGES, NOT BARE FLOORS. This repo carries `ships` (deployed: true), so
+# repo-standards' Dependencies block applies. Cite vikunja#627: vikunja-mcp declared
+# `fastmcp>=2.0`, resolved to 4.0.1 — two majors past anything tested — and the drift
+# went unobserved for ten days.
+#
+# The ceilings below are not decorative; each was measured against PyPI on 2026-09-20:
+#   fastmcp   latest 4.0.5, ceiling <4.0.0 holds it at the tested 3.3.1. Already correct.
+#   httpx     latest 0.28.1 == tested. For a 0.x package the MINOR is the breaking
+#             boundary, so the ceiling is <0.29 rather than <1.
+#   structlog latest 26.1.0, tested 25.5.0. The bare `>=24.0` floor it replaces would
+#             resolve to 26.x today — an untested major, silently.
 dependencies = [
     "fastmcp>=3.2.0,<4.0.0",
-    "httpx>=0.27",
-    "structlog>=24.0",
+    "httpx>=0.27,<0.29",
+    "structlog>=24.0,<26.0",
 ]
 
 [project.urls]
@@ -76,5 +87,16 @@ omit = [
 ]
 
 [tool.coverage.report]
-fail_under = 80
+# RATCHETED COVERAGE FLOOR — F8, and Gate Honesty's "do not shave it to make a red
+# build green".
+#
+# Measured 2026-09-20 on the src/ layout: 86.18% (579 statements, 80 missed).
+# Floor raised 80 -> 86. The previous 80 sat six points below reality, which means the
+# gate would have permitted a six-point regression without going red. Cite vikunja#680:
+# searxng-mcp's floor sat at 72/65/74/74 for ten releases while real coverage climbed
+# twelve points, and the gate silently allowed a twelve-point drop that whole time.
+#
+# Re-measure and raise this on every bump. If it goes DOWN, that is a finding to explain
+# in the CHANGELOG, not a number to edit.
+fail_under = 86
 show_missing = true

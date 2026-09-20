@@ -1,5 +1,8 @@
 # signoz-mcp
 
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-6B57FF?logo=claude&logoColor=white)](https://claude.ai/code)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 FastMCP Python MCP server for SigNoz observability queries. Gives agents read-only
 access to services, traces, logs, metrics, and alert rules via the SigNoz HTTP API.
 Targets the SigNoz **v5** query API (v0.118+).

@@ -1,0 +1,74 @@
+# CodeQL static analysis — F3.
+#
+# Free here because the repository is public; CodeQL needs a GitHub Advanced Security
+# licence only on private repositories. This workflow became a requirement the moment
+# `visibility: public` was declared honestly in repo-index.md (2026-09-20) — it was
+# scoring N/A before that, on a repo that has been public the whole time.
+#
+# TWO languages, and the second is the one usually forgotten:
+#   python   the src/ and tests/ tree
+#   actions  the workflow files themselves. release.yml holds `contents: write` and
+#            scorecard.yml holds `id-token: write`; an injection into a `run:` block in
+#            this repo's workflows would be an injection into something holding those.
+#            Adding CI without scanning CI leaves the part holding the credentials
+#            unexamined.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly. Not redundant with the push/PR triggers: CodeQL ships new queries, so code
+    # that was clean when it landed can become a finding without anyone touching it.
+    # Sunday 03:29 UTC — off the hour, where everyone else's cron fires, and clear of
+    # this repo's scorecard.yml and secret-scan.yml slots.
+    - cron: "29 3 * * 0"
+
+# Least privilege at the top level (F6); the analyse job adds only what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to upload the SARIF results to the Security tab.
+      security-events: write
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, actions]
+
+    steps:
+      # SHA-pinned with a trailing version comment (B12 + F7). Each pin below was
+      # verified against the GitHub API on 2026-09-20 by dereferencing the annotated
+      # tag to its commit — the comment is a checked claim, not a copied one.
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          # security-and-quality is a superset of the default suite. Worth the runtime on
+          # a server that holds a SigNoz API key and whose _client.py carries a
+          # never-leak-the-key contract.
+          queries: security-and-quality
+
+      # No build step. CodeQL analyses Python from source without one, and installing the
+      # project here would only add a way for the analysis to fail for reasons unrelated
+      # to the code. ci.yml already gates the build and the install.
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: /language:${{ matrix.language }}

@@ -1,5 +1,66 @@
 # Changelog
 
+## [Unreleased]
+
+### Repo standard — Baseline under corrected attributes
+
+`repo-index.md` declared `publishes: none, deployed: true` and said nothing about
+visibility, while the repo has been **public on GitHub** the whole time. Declaring
+`visibility: public` honestly (agent-platform-templates@dbcd0be) pulled in five
+requirements that had been scoring N/A. Conformance went **11 pass / 6 fail / 1 skip →
+23 pass / 0 fail / 0 skip**; the jump in failures on the declaration alone was the
+finding, not a regression.
+
+- **`src/` layout** (P2) — `signoz_mcp/` → `src/signoz_mcp/`, with `where = ["src"]`
+  in `[tool.setuptools.packages.find]`. No behavioural change.
+- **README badge row** (B2) — Claude Code first, License last.
+- **`.gitignore` covers key material** (B6) — `*.key`, `*.pem`, `*.p12`, `*.pfx`.
+- **Secret scanning as a CI gate** (B14) — `.github/workflows/secret-scan.yml`, gitleaks
+  pinned to 8.28.0 and installed in-job rather than assumed present. Gates push/PR and
+  runs a weekly **full-history** scan at `fetch-depth: 0`.
+- **`.github/CODEOWNERS`** (F2), **CodeQL** (F3, `security-and-quality`, with the
+  `actions` language alongside `python`), **OSSF Scorecard** (F4, `publish_results: true`,
+  weekly + `branch_protection_rule`).
+- **Top-level `permissions:` in every workflow** (F6) — `release.yml` previously held
+  `contents: write` at the top level, granting write to both its jobs; it now reads at
+  the top and escalates only in `create-github-release`.
+- **Committed `uv.lock`** (F5) **with `.github/dependabot.yml` behind it** — ecosystem
+  `uv`, not `pip` (`pip` would update `pyproject.toml` and leave the lock frozen). A
+  lockfile with no updater is a freeze, not an improvement (vikunja#670).
+- **Bounded version ranges** — `httpx>=0.27,<0.29` and `structlog>=24.0,<26.0` replace
+  bare floors. Not cosmetic: structlog's latest is 26.1.0, so the old `>=24.0` floor
+  resolved to an untested major. The lock now records 25.5.0 (vikunja#627).
+- **The dependency audit reads the lockfile instead of re-resolving.** `pip-audit
+  --strict .` against a project with no lockfile could only report on a fresh resolve,
+  not on the set this project runs (vikunja#633). Now `uv lock --check` for currency,
+  then **two separate gates** — runtime and dev — each run from its own directory,
+  because PEP 751 allows `pylock.<name>.toml` and a shared directory makes `pip-audit
+  --locked` silently **merge** them (measured here: 89 runtime + 84 dev → 99 merged),
+  losing the runtime-vs-dev distinction the split exists to draw.
+- **Coverage floor ratcheted 80 → 86** (F8) with its measured number and date in a
+  comment beside it. The old floor sat six points below real coverage, so the gate
+  would not have gone red on a six-point regression (vikunja#680).
+
+Each new gate was verified **two-sided** before landing — proven to fail on a planted
+violation as well as pass on the clean tree:
+
+| Gate | Fails on | Passes on |
+|---|---|---|
+| gitleaks (B14) | synthetic PAT committed to a throwaway copy → exit 1 | real tree → exit 0 |
+| `uv lock --check` | a dependency added to `pyproject.toml` → exit 1 | in-sync lock → exit 0 |
+| `pip-audit --locked` | jinja2 2.11.3 planted in a lock copy → exit 1, 4 advisories | real runtime + dev locks → exit 0 |
+
+`tests/check_gitleaks_gate.py` runs the gitleaks half of that table in CI, before the
+clean result is believed.
+
+### Deployment note
+
+`ecosystem.config.js` is unchanged and `args: "-m signoz_mcp.server"` is still correct,
+but the `src/` move **does not survive on the installed package alone**: the venv's
+editable install hardcodes the pre-move path, and `import signoz_mcp` raised
+`ModuleNotFoundError` after the move until `pip install -e .` was re-run. Deploying this
+needs a venv reinstall, not just a PM2 restart.
+
 ## [0.3.0] — 2026-07-19
 
 ### Breaking

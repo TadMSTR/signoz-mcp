@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# TOP-LEVEL LEAST PRIVILEGE — F6. Without this block GitHub's default is WRITE, and the
+# failure is silent: nothing goes red, the token is simply broader than any job needs.
+# Cite: OSSF Scorecard's Token-Permissions check scored searxng-mcp 0/10 and named every
+# workflow in the repo. Jobs escalate individually, at the job level, next to the step
+# that needs it — none below currently does.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test (Python ${{ matrix.python-version }})
@@ -33,9 +41,28 @@ jobs:
       - name: Format check (ruff)
         run: ruff format --check .
 
+      # --cov=signoz_mcp still names the IMPORT path, not the directory, so it is
+      # unchanged by the src/ layout move. The floor it enforces is in pyproject.toml
+      # and carries its measured number and date (F8).
       - name: Test
         run: pytest --cov=signoz_mcp --cov-report=term-missing
 
+  # DEPENDENCY AUDIT.
+  #
+  # This job existed before this build and was structurally unable to do its job: it ran
+  # `pip-audit --strict .` against a project with NO LOCKFILE, so pip-audit read the
+  # RANGE specs in pyproject.toml and RE-RESOLVED them. That reports on "what a fresh
+  # install would get today" rather than on the set this project actually runs.
+  #
+  # vikunja#633 is the shape: searxng-mcp's audit re-resolved from declared ranges and
+  # read undici 7.29.0 GREEN, while the deployed container ran undici 7.28.0 with four
+  # HIGH advisories. A gate that is green because it looked somewhere else is worse than
+  # no gate, because it gets reported as coverage.
+  #
+  # Scope note, stated rather than hidden: the `test` job above still installs from the
+  # declared ranges, so tests run against a resolve while the audit runs against the
+  # lock. That is deliberate — the matrix exists to catch range breakage — but it does
+  # mean a green test run is not evidence about the locked set.
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
@@ -48,11 +75,74 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pip-audit
-        run: pip install pip-audit
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
-      - name: Audit dependencies
-        run: pip-audit --strict .
+      # THE GATE THAT MATTERS MOST.
+      #
+      # A committed lockfile with nothing checking its currency is not a pinned
+      # dependency set, it is a stale file that looks like one. F5 tests for the file's
+      # PRESENCE; this step is what makes that presence mean something. When scoped-mcp
+      # added this same gate its uv.lock was two and a half months behind pyproject.toml
+      # and was MISSING a dependency declared in two extras — every check below it would
+      # have audited that set and passed.
+      - name: Lockfile is in sync with pyproject.toml
+        run: uv lock --check
+
+      # Split into two gates rather than one. They fail for different reasons and want
+      # different responses: a runtime advisory affects the service deployed on forge, a
+      # dev-tooling advisory affects only this repository's CI. Collapsing them makes the
+      # urgent case indistinguishable from the routine one.
+      #
+      # No container gate — this repo has no Dockerfile.
+      - name: Export runtime dependency set
+        # --all-extras --no-extra dev: every optional dependency a consumer can install,
+        # and none of the tooling. `telemetry` belongs on THIS side: it is off by default
+        # but it is what the deployed process would load if a sink were enabled.
+        #
+        # --no-emit-project because `--strict` trips on the project's own entry, which uv
+        # emits as a `directory = {...}` with no version.
+        run: |
+          uv export --frozen --no-emit-project \
+            --all-extras --no-extra dev \
+            --format pylock.toml -o pylock.runtime.toml
+
+      - name: Export dev dependency set
+        run: |
+          uv export --frozen --no-emit-project \
+            --extra dev \
+            --format pylock.toml -o pylock.dev.toml
+
+      # EACH GATE RUNS IN ITS OWN DIRECTORY, AND THE REASON IS NOT THE ONE USUALLY GIVEN.
+      #
+      # The reason recorded elsewhere in the fleet is that `pip-audit --locked` falls
+      # back to resolving pyproject.toml and exits zero. Measured 2026-09-18 against
+      # pip-audit 2.10.1, that is NOT what happens: with no lockfile present it errors
+      # `no lockfile found in .` and exits 1.
+      #
+      # What IS true, and is the actual reason for the isolation:
+      #
+      #   PEP 751 permits `pylock.<name>.toml`, so BOTH exports above are valid lockfile
+      #   names and `pip-audit --locked .` from the repo root picks up BOTH.
+      #
+      # So the failure is not a silent green — it is a silent MERGE. The two gates
+      # collapse into one that is still red when something is wrong, but can no longer
+      # say whether the vulnerable package is one forge RUNS or one CI merely BUILDS
+      # WITH. That is the entire distinction the split exists to draw, lost with no
+      # signal. Copying each pylock into its own directory is what prevents it.
+      #
+      # No --audit-level widening and no blanket --ignore-vuln. A narrow, dated,
+      # ticket-referenced ignore for one named advisory is the only sanctioned escape;
+      # raising a threshold silently reclassifies every future finding below the new line.
+      - name: Audit runtime dependencies
+        run: |
+          mkdir -p .audit-runtime && cp pylock.runtime.toml .audit-runtime/pylock.toml
+          uv tool run pip-audit --strict --locked .audit-runtime
+
+      - name: Audit dev dependencies
+        run: |
+          mkdir -p .audit-dev && cp pylock.dev.toml .audit-dev/pylock.toml
+          uv tool run pip-audit --strict --locked .audit-dev
 
   build:
     name: Build distribution
@@ -73,6 +163,10 @@ jobs:
       - name: Build sdist and wheel
         run: python -m build
 
+      # Proves the src/ layout is packaged correctly — a pyproject that RESOLVES but does
+      # not INSTALL is invisible until release day otherwise. This is not theoretical for
+      # this repo: the src/ move required `where = ["src"]`, and without it the wheel
+      # would build empty and this step is what catches that.
       - name: Verify wheel contents
         run: |
           pip install dist/*.whl
