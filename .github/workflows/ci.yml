@@ -181,3 +181,33 @@ jobs:
         run: |
           pip install dist/*.whl
           python -c "import signoz_mcp; print('install ok')"
+
+  # ACTION PIN CONSISTENCY.
+  #
+  # Dependabot PR #12 bumped `github/codeql-action/init` alone, because Dependabot treats
+  # that action's three subpaths as three independent dependencies. Both CodeQL matrix
+  # jobs then failed with `Loaded a configuration file for version '4.38.0', but running
+  # version '4.37.9'`. Nothing in this repo's CI noticed; a review bot noticed, in prose,
+  # on one PR.
+  #
+  # `.github/dependabot.yml` now groups those subpaths, which stops Dependabot raising
+  # that PR again. It does not stop a HAND EDIT doing the same thing, and a policy in a
+  # config file is not a gate. This is the gate.
+  #
+  # Cheap on purpose: no setup-python step, because the checker is stdlib-only and the
+  # runner's python3 is sufficient. Adding a pinned action here to run a pin checker
+  # would be one more pin to keep consistent.
+  workflow-pins:
+    name: Action pins are consistent
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Two-sided by construction — the script plants a divergence into a throwaway copy
+      # and requires itself to find it before it reports the real tree as clean. See the
+      # module docstring, and tests/check_gitleaks_gate.py for the same argument at
+      # length: "found nothing" from a broken checker and from a working one are the same
+      # green tick.
+      - name: Check action pins
+        run: python3 tests/check_action_pins.py

@@ -51,9 +51,41 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # EXPLICIT, because leaving it implicit was the defect. The comment on the uv
+    # ecosystem above already explains that at the cap a further update is silently not
+    # raised rather than queued — and then this ecosystem was left on the default of 5.
+    # Measured 2026-09-20: Dependabot's first run opened exactly five PRs (#8-#12) and
+    # raised none for `github/codeql-action/analyze`, whose v4.38.0 bump demonstrably
+    # exists. Five open, default five, and the sixth missing.
+    #
+    # Sized against the repo rather than picked: seven distinct actions are pinned once
+    # the codeql-action subpaths group below (nine refs, three of which collapse to
+    # one). Ten leaves headroom for a new action without the cap becoming the thing
+    # that decides what gets updated.
+    open-pull-requests-limit: 10
     # Actions are SHA-pinned with a trailing version comment (B12, and F7 under
     # visibility: public). Dependabot understands SHA pins and bumps the SHA while
     # updating that comment, so pinning costs no update coverage.
+    #
+    # THE GROUP IS NOT A CONVENIENCE. Dependabot treats `github/codeql-action/init`,
+    # `/analyze` and `/upload-sarif` as three independent dependencies, so ungrouped it
+    # will bump one of a matched set. Measured: PR #12 moved `init` to 4.38.0 alone and
+    # both CodeQL matrix jobs died with
+    #
+    #     Loaded a configuration file for version '4.38.0', but running version '4.37.9'
+    #
+    # That is not a flaky run, it is a configuration error the action raises by design —
+    # every subpath in one CodeQL run must be the same version. Grouping is what makes
+    # the pins move as the one unit they actually are.
+    #
+    # NARROW, not one broad `actions` group. The defect being fixed is specifically a
+    # matched set moving apart; a broad group would also fix it but would bundle
+    # unrelated bumps into a single merge decision, so one bad action would block every
+    # other update behind it. Each unrelated action keeps its own readable diff.
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]

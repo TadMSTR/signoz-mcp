@@ -1,5 +1,49 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed — supply-chain hygiene
+
+No runtime code changed; this is entirely `.github/`.
+
+- **Dependabot could not keep `github/codeql-action` self-consistent.** It treats `init`,
+  `analyze` and `upload-sarif` as three independent dependencies, so its first run raised
+  PR #12 bumping `init` alone and both CodeQL matrix jobs failed with
+  `Loaded a configuration file for version '4.38.0', but running version '4.37.9'`. A
+  `groups:` entry on the `github-actions` ecosystem now moves the subpaths as one unit.
+  Narrow rather than one broad `actions` group: a broad group would bundle unrelated
+  bumps into a single merge decision, so one bad action would hold every other update
+  behind it.
+
+- **`open-pull-requests-limit` was implicit on the `github-actions` ecosystem**, taking
+  Dependabot's default of 5 — on the same file whose `uv` comment already warns that at
+  the cap "a further update is silently not raised rather than queued". Exactly five PRs
+  were open and no PR existed for `codeql-action/analyze`, whose v4.38.0 bump does exist.
+  Now set explicitly to 10, sized against the seven distinct actions this repo pins once
+  the codeql subpaths group.
+
+- **`secret-scan.yml` ran gitleaks twice on every pull request.** Its `push:` trigger had
+  no branch filter, so each branch push fired it once for the push and again for the PR —
+  measured as two `gitleaks` check-runs on each of PRs #8-#12. Scoped to `branches: [main]`,
+  matching `ci.yml`. The weekly full-history scan is unchanged.
+
+### Added
+
+- **`tests/check_action_pins.py` and a `workflow-pins` CI job** — fails when one action's
+  subpaths are pinned to different commits. The `groups:` entry above stops *Dependabot*
+  splitting a matched set; it does not stop a hand edit, and a policy in a config file is
+  not a gate.
+
+  Two-sided on every run, not once by hand at review time: the script plants a divergence
+  into a throwaway copy of `.github/workflows/` and requires itself to find it before it
+  will report the real tree as clean, and it refuses to report a pass at all if no action
+  has more than one usage to diverge. Verified against the actual PR #12 tree, which it
+  reports red. Same argument as `tests/check_gitleaks_gate.py`: "found nothing" from a
+  broken checker and from a working one are the same green tick.
+
+  The rule groups by `owner/repo`, so it covers any future multi-subpath action without
+  an edit.
+
 ## [0.4.0] — 2026-09-20
 
 ### Breaking
