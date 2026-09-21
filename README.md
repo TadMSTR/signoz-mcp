@@ -33,7 +33,28 @@ Targets the SigNoz **v5** query API (v0.118+).
 | `fleet_health` | Per-service `calls`, `errors`, `error_rate`, `p95_nano`/`p95_ms` — **one** query, so every column comes from the same scan |
 | `compare_windows` | Per-group delta between two windows — `before`, `after`, `delta`, `pct_change`. Answers "what changed since the deploy" |
 
+`fleet_health` and `list_services` both return per-service RED-style metrics, but they are
+not interchangeable: `list_services`' `p99`/`avgDuration` are scoped to each service's
+top-level operations only, while `fleet_health`'s `p95`/`error_rate` come from a single
+scan over every span, so all of its columns share one consistent scope. Use
+`list_services` for top-level-request latency; use `fleet_health` when you need numbers
+that are guaranteed to come from the same scan (e.g. before dividing errors by calls).
+
 All tools are read-only — the server never exposes SigNoz write endpoints.
+
+## Upgrading from 0.3.x
+
+Two tool signatures changed in 0.4.0 — both were silently-wrong-answer paths, so treat a
+caller that still runs unchanged as one still getting the wrong answer. Full reasoning is
+in [CHANGELOG.md](CHANGELOG.md); the summary:
+
+- **`list_services`** now returns `list[dict]` instead of `list[str]`, and takes
+  `start`/`end`. Callers that treated the result as a bare list of service names must
+  switch to reading the `serviceName` key off each dict.
+- **`tail_logs`** no longer accepts `service`. It previously validated the argument and
+  then filtered on severity alone, so passing it never did anything — it is now a
+  `TypeError` rather than a silent no-op. Use `search_logs(filter=...)` instead, and read
+  the [Logs](#logs) section below first.
 
 ## Configuration
 
@@ -86,10 +107,10 @@ ruff format .
 
 ## Logs
 
-**The log tools currently raise rather than return `[]`.** Nothing on forge exports OTLP
-logs and the collector has no `filelog` receiver, so SigNoz's log store is empty —
-measured 0 rows at `-720h`, while `get_health()` and `aggregate_traces` both pass as
-controls (vikunja#926).
+**Nothing on forge exports OTLP logs**, and the collector has no `filelog` receiver, so
+SigNoz's log store is empty — measured 0 rows at `-720h`, while `get_health()` and
+`aggregate_traces` both pass as controls (vikunja#926). Because of that, **the log tools
+currently raise rather than return `[]`.**
 
 Rather than return an empty list that an agent would read as "no matching logs",
 `tail_logs` and `search_logs` detect the no-data-at-all case and raise a message naming
