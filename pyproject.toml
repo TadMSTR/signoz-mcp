@@ -66,7 +66,7 @@ dev = [
     #
     # Bumps come via Dependabot's batched dev-dependency PR, which is where a formatting
     # change belongs: visible, in one diff, and deliberate.
-    "ruff==0.16.8",
+    "ruff==0.16.9",
 ]
 
 [project.scripts]
