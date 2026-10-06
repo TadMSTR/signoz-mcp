@@ -97,8 +97,16 @@ updates:
     # matched set moving apart; a broad group would also fix it but would bundle
     # unrelated bumps into a single merge decision, so one bad action would block every
     # other update behind it. Each unrelated action keeps its own readable diff.
+    #
+    # The group is repeated for security updates ON PURPOSE. A group without `applies-to`
+    # covers version updates only (GitHub: "When undefined, defaults to version updates"), so
+    # a single group leaves the security channel able to split the same set (vikunja#1032).
     groups:
       codeql-action:
+        patterns:
+          - "github/codeql-action*"
+      codeql-action-security:
+        applies-to: security-updates
         patterns:
           - "github/codeql-action*"
     ignore:
