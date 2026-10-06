@@ -4,8 +4,9 @@
 
 ### Fixed — supply-chain hygiene
 
-No **application** runtime code changed. The diff is `.github/` plus one checker
-script under `tests/`.
+No **application** runtime code changed. The changes in this section are `.github/`
+plus one checker script under `tests/`. The `uv.lock` change is listed separately under
+Security below.
 
 - **Dependabot could not keep `github/codeql-action` self-consistent.** It treats `init`,
   `analyze` and `upload-sarif` as three independent dependencies, so its first run raised
