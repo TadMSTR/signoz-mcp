@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed — codeql-action security channel
+
+- **The `codeql-action` group covered version updates only.** A group without `applies-to`
+  defaults to version updates, so a security update could still split `init`, `analyze`
+  and `upload-sarif` across PRs. A `codeql-action-security` group (`applies-to:
+  security-updates`) now covers that channel, copied from scoped-mcp (vikunja#1032).
+
 ### Fixed — supply-chain hygiene
 
 No **application** runtime code changed. The changes in this section are `.github/`
