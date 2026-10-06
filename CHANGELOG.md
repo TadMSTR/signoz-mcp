@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-10-06
+
+Dependency and supply-chain release. No application code changed.
+
+### Changed — dependencies
+
+- **OpenTelemetry 1.44.0 → 1.45.0** (semantic-conventions 0.65b0 → 0.66b0) in the
+  `telemetry` extra, one group PR (#21). Adds `opentelemetry-exporter-otlp-common` 0.66b0 as
+  a new transitive package.
+- **CI actions:** codeql-action group (#15), astral-sh/setup-uv 10.1.0 → 10.2.0 (#16).
+  ruff 0.16.8 → 0.16.10 (dev only).
+
 ### Fixed — codeql-action security channel
 
 - **The `codeql-action` group covered version updates only.** A group without `applies-to`
