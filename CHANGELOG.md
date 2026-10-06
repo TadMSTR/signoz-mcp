@@ -54,6 +54,18 @@ script under `tests/`.
   The rule groups by `owner/repo`, so it covers any future multi-subpath action without
   an edit.
 
+### Changed
+- **Dependabot `uv`: `opentelemetry` and `dev-tools` groups.** Every per-package OTel PR
+  already moved the whole family in `uv.lock`, so they were one change filed several times.
+  `dev-dependencies` never caught the tools because `dev` is an optional-dependencies extra,
+  not a `[dependency-groups]` table, so ruff arrived on its own. Both groups sit above
+  `dev-dependencies`, since a dependency joins the first group it matches (vikunja#1031).
+
+### Security
+- **pyjwt 2.14.0 → 2.15.1 in `uv.lock`** (PYSEC-2026-4141, CVE-2026-102275). Transitive, so
+  no Dependabot PR touched it (vikunja#1031). The deployed `.venv` is not changed here; it
+  already lags the lock (vikunja#933).
+
 ## [0.4.0] — 2026-09-20
 
 ### Breaking
