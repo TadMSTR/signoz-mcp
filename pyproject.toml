@@ -1,10 +1,12 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# Pinned exactly: uv.lock does not lock build dependencies, so a range here would let
+# every wheel build pick up whatever setuptools is newest that day.
+requires = ["setuptools==84.2.1", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "signoz-mcp"
-version = "0.4.1"
+version = "0.5.0"
 description = "FastMCP server for SigNoz observability queries — read-only access to services, traces, logs, metrics, and alerts"
 readme = "README.md"
 license = "MIT"
@@ -30,10 +32,37 @@ classifiers = [
 #             boundary, so the ceiling is <0.29 rather than <1.
 #   structlog latest 26.1.0, tested 25.5.0. The bare `>=24.0` floor it replaces would
 #             resolve to 26.x today — an untested major, silently.
+#
+# SECURITY FLOORS (2026-10-30). Below the three direct dependencies, each entry is
+# declared only to hold a floor: the first release with a published security fix, for a
+# package that a tool call reaches. Traced by serving streamable-http and calling tools:
+# - transport: fastmcp, mcp, starlette, python-multipart, anyio, h11 (uvicorn's parser)
+# - pyjwt: mcp's auth layer. Not loaded today (no auth provider is configured); floored
+#   so that enabling one cannot pick up an old release
+# - opentelemetry-api: fastmcp parses every tool call's `_meta` trace context with it,
+#   whether or not a telemetry sink is configured
+# - certifi: the SigNoz client loads its CA bundle on every call. forge's SigNoz URL is
+#   plain HTTP, but SIGNOZ_URL can point at HTTPS.
+#
+# uv.lock is the control: it pins every package, and a deploy builds a fresh venv from
+# it. A fresh resolve outside the lock could still pick an older release of these, which
+# no tool call reaches (idna loads, but nothing encodes a non-ASCII host; pygments,
+# pydantic-settings and python-dotenv run at startup or in log rendering only): authlib,
+# cryptography, dnspython, idna, jaraco-context, joserfc, protobuf, pyarrow,
+# pydantic-settings, pygments, python-dotenv, urllib3.
 dependencies = [
-    "fastmcp>=3.2.0,<4.0.0",
+    "fastmcp>=3.4.10,<4.0.0",
     "httpx>=0.27,<0.29",
     "structlog>=24.0,<26.0",
+    # Capped below 2 with fastmcp's own range.
+    "mcp>=1.30.0,<2",
+    "starlette>=1.3.1",
+    "python-multipart>=0.0.31",
+    "anyio>=4.14.2",
+    "h11>=0.16.0",
+    "pyjwt>=2.15",
+    "opentelemetry-api>=1.45.1",
+    "certifi>=2026.10.18",
 ]
 
 [project.urls]

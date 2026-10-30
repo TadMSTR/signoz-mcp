@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-30
+
+Dependency and install-model release. No application code changed, and no tool signature
+changed.
+
+### Changed — install model
+
+- **The service now runs an installed copy built from `uv.lock`, not an editable
+  install.** The README "Installation" section is a script: it checks that the checkout
+  is exactly the release tag on origin with nothing else in it (ignored files included,
+  because `python -m` puts the checkout first on `sys.path`), builds a fresh `.venv` with
+  `uv sync --frozen --no-editable`, checks the venv against the lock with `uv sync
+  --check`, and checks that the package imports from site-packages and reports the
+  release version. Upgrading from 0.4.x means rebuilding the venv this way; `pip install
+  -e .` into the old venv keeps its old dependency versions.
+
+### Changed — dependencies
+
+- **Security floors:** fastmcp 3.4.10, mcp 1.30.0, starlette 1.3.1, python-multipart
+  0.0.31, anyio 4.14.2, h11 0.16.0, pyjwt 2.15, opentelemetry-api 1.45.1, certifi
+  2026.10.18. The `pyproject.toml` comment says why each is there and names the packages
+  that only the lock holds.
+- **Lock refresh:** fastmcp 3.4.7 → 3.4.11, authlib 1.8.0 → 1.9.1, certifi 2026.7.22 →
+  2026.10.23, dnspython 2.8.0 → 2.9.1, joserfc 1.7.5 → 1.7.7, OpenTelemetry 1.45.0 →
+  1.45.2. Includes the bumps Dependabot proposed in PR #35 and PR #26.
+- **Build backend pinned:** `setuptools==84.2.1`, `wheel==0.48.0`. `uv.lock` does not
+  lock build dependencies.
+
+### Changed — CI
+
+- The test matrix installs from the lock (`uv sync --frozen --extra dev --extra
+  telemetry`) instead of `pip install -e ".[dev]"`, so the tests run on the set that is
+  audited and deployed.
+- A gating `latest` job re-resolves to the newest versions the ranges allow and runs the
+  suite, on every push and weekly.
+- uv is pinned to 0.13.4 in every job, and every checkout sets
+  `persist-credentials: false`, including the release job that holds `contents: write`.
+
+### Changed — repository hygiene
+
+- `.gitignore`: `core.*` is now `core.[0-9]*`, so it no longer matches source files named
+  `core.<ext>`, and `.env.*` is ignored.
+
 ## [0.4.1] — 2026-10-06
 
 Dependency and supply-chain release. No application code changed.

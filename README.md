@@ -80,12 +80,85 @@ parties can intercept tool calls without editing the server — see
 
 ## Installation
 
+signoz-mcp is not published to PyPI. Install it from a checkout of a release tag, from the
+committed `uv.lock`, so the dependency set is the one CI tested and audited. The package is
+installed into the venv as a copy (not editable), so the code that runs is the release's,
+and its recorded version is true. Use [uv](https://docs.astral.sh/uv/).
+
+Save this as a script and run it with `bash`. Don't paste it into a shell: every check ends
+the run on failure, and that only works under `set -e` in a script.
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-# with telemetry backends:
-pip install -e ".[telemetry]"
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION=0.5.0
+REPO=~/repos/signoz-mcp
+PY=/usr/bin/python3.13
+EXTRAS=(--extra telemetry)   # drop it if no telemetry backend will ever be enabled
+die() { echo "install: $*" >&2; exit 1; }
+
+[ -d "$REPO/.git" ] || git clone https://github.com/TadMSTR/signoz-mcp "$REPO"
+cd "$REPO" || die "cannot enter $REPO"
+git fetch --tags origin
+git checkout --quiet "v$VERSION"
+
+# 1. The checkout is exactly the release tag on the remote, and nothing else. The service
+#    starts with `python -m signoz_mcp.server` from this directory, and `python -m` puts
+#    the directory first on sys.path, so anything importable here would shadow the
+#    installed package. Python also loads a module from __pycache__ whenever the cached
+#    header's source mtime and size match, and `git status` does not show ignored files.
+#    Remove bytecode and tool caches, then refuse anything left except the venv and .env
+#    files.
+find . -path ./.venv -prune -o \( -name __pycache__ -o -name '*.py[co]' \) -print0 \
+  | xargs -0 -r rm -rf --
+rm -rf .pytest_cache .ruff_cache .coverage htmlcov build dist ./*.egg-info src/*.egg-info
+status=$(git status --porcelain --ignored)
+extra=$(printf '%s\n' "$status" | grep -vxE '(!! (\.venv/|\.env|\.env\.[^/]+))?' || true)
+[ -z "$extra" ] || die "checkout holds more than v$VERSION; remove these first:
+$extra"
+# The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
+tag=$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
+[ -n "$tag" ] || die "tag v$VERSION is not on origin"
+[ "$(git rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
+
+# 2. Build a fresh venv at the path the service runs from. Stop the service and move the
+#    old venv aside first (outside the checkout); this refuses to build over one. Pin the
+#    interpreter: uv otherwise prefers a Python it manages itself, which `uv python` can
+#    later remove or replace under a running service.
+[ ! -e .venv ] || die ".venv exists: stop the service and move it aside first"
+UV_PROJECT_ENVIRONMENT="$REPO/.venv" \
+  uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY"
+
+# 3. The venv is exactly the lock (no missing, extra or different package), and the
+#    package imports from the venv, not from the checkout, when started the way PM2 starts
+#    it: from this directory.
+UV_PROJECT_ENVIRONMENT="$REPO/.venv" \
+  uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
+  || die "venv does not match uv.lock"
+# The server refuses to import without SIGNOZ_API_KEY; a placeholder is enough to import.
+SIGNOZ_API_KEY=import-check .venv/bin/python - "$VERSION" <<'EOF' \
+  || die "installed package check failed"
+import importlib.metadata as m, sys, signoz_mcp, signoz_mcp.server
+assert "/site-packages/" in signoz_mcp.__file__, signoz_mcp.__file__
+assert m.version("signoz-mcp") == sys.argv[1], m.version("signoz-mcp")
+print("signoz-mcp", sys.argv[1], "from", signoz_mcp.__file__)
+EOF
+echo "install: signoz-mcp v$VERSION ready; restart the service"
 ```
+
+Build a fresh venv rather than installing into an existing one: an install into an existing
+venv keeps whatever older dependency versions it finds there, if they still satisfy the
+declared ranges. Build at the final path rather than building elsewhere and moving it: the
+venv's scripts embed its path. A uv-built venv has no `pip`. Stop the service before
+replacing its venv, and restart it after step 3. Under PM2, restart it by name
+(`pm2 restart signoz-mcp`): `ecosystem.config.js` reads `SIGNOZ_API_KEY` from the shell that
+first started it, so a `pm2 delete` and `start`, or `--update-env`, from a shell without the
+key loses it.
+
+CI audits the locked set on every push and weekly, but nothing reads a scheduled run's
+result unless you watch it, and GitHub disables a public repository's scheduled workflows
+after 60 days without activity. Audit the deployed venv where it runs as well (for example
+`pip-audit --path .venv/lib/python3.13/site-packages`).
 
 ## Running
 
@@ -98,11 +171,11 @@ pm2 start ecosystem.config.js
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-pytest
-pytest --cov=signoz_mcp --cov-report=term-missing
-ruff check .
-ruff format .
+uv sync --frozen --extra dev --extra telemetry
+uv run --frozen --no-sync pytest
+uv run --frozen --no-sync pytest --cov=signoz_mcp --cov-report=term-missing
+uv run --frozen --no-sync ruff check .
+uv run --frozen --no-sync ruff format .
 ```
 
 ## Logs

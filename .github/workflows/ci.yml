@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Weekly, Monday 05:47 UTC, so the `latest` job meets a new upstream release
+    # without waiting for a PR.
+    - cron: "47 5 * * 1"
 
 # TOP-LEVEL LEAST PRIVILEGE — F6. Without this block GitHub's default is WRITE, and the
 # failure is silent: nothing goes red, the token is simply broader than any job needs.
@@ -25,27 +29,90 @@ jobs:
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # No token left in .git/config for later steps to read.
+          persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
+        id: py
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
 
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # Without this the SHA-pinned action fetches the latest uv. Move it by hand,
+          # in every job, alongside a `uv lock` refresh.
+          version: "0.13.4"
+
+      # FROM THE LOCK. `--frozen` installs exactly uv.lock and fails rather than
+      # re-resolve, so a green run is evidence about the set that is deployed. The
+      # `telemetry` extra is what production carries, so the tests run with it. The
+      # declared ranges are tested by the `latest` job below.
+      - name: Install dependencies (locked, [dev,telemetry])
+        env:
+          UV_PYTHON: ${{ steps.py.outputs.python-path }}
+        run: uv sync --frozen --extra dev --extra telemetry
 
       - name: Lint (ruff)
-        run: ruff check .
+        run: uv run --frozen --no-sync ruff check .
 
       - name: Format check (ruff)
-        run: ruff format --check .
+        run: uv run --frozen --no-sync ruff format --check .
 
       # --cov=signoz_mcp still names the IMPORT path, not the directory, so it is
       # unchanged by the src/ layout move. The floor it enforces is in pyproject.toml
       # and carries its measured number and date (F8).
       - name: Test
-        run: pytest --cov=signoz_mcp --cov-report=term-missing
+        run: uv run --frozen --no-sync pytest --cov=signoz_mcp --cov-report=term-missing
+
+  # The newest versions pyproject.toml allows, not the lock. The lock is what ships, so
+  # every other job tests it; this one exists because a pin alone hides a
+  # forward-compatibility break until the day someone re-resolves. Before the matrix moved
+  # onto the lock it did this implicitly, by installing from the ranges.
+  #
+  # GATING, deliberately. fastmcp and mcp are capped below their next major, so anything
+  # that breaks here is a release a fresh install could pick up today. A
+  # continue-on-error job would show a green tick over a red run.
+  latest:
+    name: Test against latest allowed versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # No token left in .git/config for later steps to read.
+          persist-credentials: false
+
+      - name: Set up Python
+        id: py
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.4"
+
+      - name: Resolve and install the newest allowed set
+        env:
+          UV_PYTHON: ${{ steps.py.outputs.python-path }}
+        run: |
+          uv lock --upgrade
+          uv sync --frozen --extra dev --extra telemetry
+
+      # Read from the project venv: a bare `uv pip list` follows UV_PYTHON to the
+      # setup-python interpreter, which has none of these installed.
+      - name: Versions under test
+        run: >-
+          uv run --frozen --no-sync python -c "import importlib.metadata as m;
+          [print(p, m.version(p)) for p in
+          ('fastmcp', 'mcp', 'starlette', 'uvicorn', 'httpx', 'structlog')]"
+
+      - run: uv run --frozen --no-sync pytest
 
   # DEPENDENCY AUDIT.
   #
@@ -59,16 +126,17 @@ jobs:
   # HIGH advisories. A gate that is green because it looked somewhere else is worse than
   # no gate, because it gets reported as coverage.
   #
-  # Scope note, stated rather than hidden: the `test` job above still installs from the
-  # declared ranges, so tests run against a resolve while the audit runs against the
-  # lock. That is deliberate — the matrix exists to catch range breakage — but it does
-  # mean a green test run is not evidence about the locked set.
+  # The `test` matrix installs this same lock, so the set the tests pass on is the set
+  # audited here. The declared ranges are exercised by the `latest` job.
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # No token left in .git/config for later steps to read.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -77,6 +145,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.4"
 
       # THE GATE THAT MATTERS MOST.
       #
@@ -161,6 +231,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # No token left in .git/config for later steps to read.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -203,6 +276,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # No token left in .git/config for later steps to read.
+          persist-credentials: false
 
       # Two-sided by construction — the script plants a divergence into a throwaway copy
       # and requires itself to find it before it reports the real tree as clean. See the

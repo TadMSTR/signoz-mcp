@@ -1,3 +1,7 @@
+// The venv is built from uv.lock, non-editable, by the install script in README.md
+// ("Installation"). Restart by name (`pm2 restart signoz-mcp`): SIGNOZ_API_KEY below is
+// read from the shell that first started the app, so `pm2 delete` + `start`, or
+// `--update-env`, from a shell without it loses the key.
 module.exports = {
   apps: [{
     name: "signoz-mcp",
