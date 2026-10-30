@@ -37,6 +37,7 @@ changed.
   audited and deployed.
 - A gating `latest` job re-resolves to the newest versions the ranges allow and runs the
   suite, on every push and weekly.
+- The wheel build frontend is pinned (`build==1.6.1`) in CI and in the release workflow.
 - uv is pinned to 0.13.4 in every job, and every checkout sets
   `persist-credentials: false`, including the release job that holds `contents: write`.
 

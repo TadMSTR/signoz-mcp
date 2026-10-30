@@ -240,8 +240,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The build frontend is pinned like the backend (pyproject build-system.requires):
+      # this job produces the shipped artefact.
       - name: Install build tools
-        run: pip install build
+        run: pip install "build==1.6.1"
 
       - name: Build sdist and wheel
         run: python -m build
