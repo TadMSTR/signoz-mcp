@@ -9,21 +9,20 @@ changed.
 
 ### Changed — install model
 
-
 - **The service now runs an installed copy built from `uv.lock`, not an editable install.**
-  The README "Installation" section is a script: it checks that the checkout is exactly the
-  release tag on origin with nothing else in it (ignored files included, because `python -m`
-  puts the checkout first on `sys.path`), builds a fresh `.venv` with `uv sync --frozen
-  --no-editable`, checks the venv against the lock with `uv sync --check`, and checks that
-  the package imports from site-packages and reports the release version. Git config cannot
-  change what it sees (status modes and `core.fsmonitor` are set on the command line). It
-  also refuses tracked files hidden from `git status` (assume-unchanged, skip-worktree) and
-  a `.env` in the checkout, builds without uv's cache, compares every file the install
-  recorded (the dist-info RECORD) with a wheel built from the tag (`git archive`), defaults
-  `REPO` to the directory `ecosystem.config.js` runs from, and refuses to start while
-  `.venv` exists, so the checkout cannot change under a running editable install. Upgrading
-  from 0.4.x means rebuilding the venv this way; `pip install -e .` into the old venv keeps
-  its old dependency versions.
+  The README "Installation" section is a script. It clones the release tag fresh from GitHub
+  (system and global git config ignored), checks that the clone is the commit the tag names
+  on GitHub, and builds a fresh `.venv` from that clone with `uv sync --frozen --no-editable
+  --no-cache --no-config`, so the lock and source that are installed are the release's and
+  never the checkout's. It checks the venv against the lock (`uv sync --check`), compares
+  every file the install recorded (the dist-info RECORD) with a wheel built from the clone,
+  and checks that the package imports from site-packages and reports the release version.
+  The checkout the service runs from (`python -m` puts it first on `sys.path`) is moved to
+  the tag, cleared of bytecode and tool caches, and compared file by file with the clone; a
+  stray module, a `.env` or an edited file stops the install. `REPO` defaults to the
+  directory `ecosystem.config.js` runs from, and the script refuses to start while `.venv`
+  exists. Upgrading from 0.4.x means rebuilding the venv this way; `pip install -e .` into
+  the old venv keeps its old dependency versions.
 
 ### Changed — dependencies
 

@@ -80,8 +80,10 @@ parties can intercept tool calls without editing the server — see
 
 ## Installation
 
-signoz-mcp is not published to PyPI. Install it from a checkout of a release tag, from the
-committed `uv.lock`, so the dependency set is the one CI tested and audited. The package is
+signoz-mcp is not published to PyPI. The script below installs a release tag from a fresh
+clone of it, using that clone's committed `uv.lock`, so the dependency set is the one CI
+tested and audited. The checkout the service runs from is updated to the tag and compared
+with the clone, but nothing is installed from it. The package is
 installed into the venv as a copy (not editable), so the code that runs is the release's,
 and its recorded version is true. Use [uv](https://docs.astral.sh/uv/).
 
@@ -92,66 +94,91 @@ the run on failure, and that only works under `set -e` in a script.
 #!/usr/bin/env bash
 set -euo pipefail
 VERSION=0.5.0
+URL=https://github.com/TadMSTR/signoz-mcp
 # The directory the service runs from: ecosystem.config.js `cwd`.
 REPO=${REPO:-$HOME/repos/personal/signoz-mcp}
 PY=/usr/bin/python3.13
 EXTRAS=(--extra telemetry)   # drop it if no telemetry backend will ever be enabled
 die() { echo "install: $*" >&2; exit 1; }
-# Git config must not change what the checks see: no fsmonitor hook, no untracked cache.
-g() { git -c core.fsmonitor=false -c core.untrackedCache=false "$@"; }
 tmp=$(mktemp -d) && trap 'rm -rf -- "$tmp"' EXIT
+# Git without the system or global config (no URL rewrites, no hooks, no fsmonitor).
+gx() {
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+}
 
-[ -d "$REPO/.git" ] || g clone https://github.com/TadMSTR/signoz-mcp "$REPO"
-cd "$REPO" || die "cannot enter $REPO"
 # 0. Stop the service and move its venv aside (outside the checkout) BEFORE this runs.
-#    Until it is replaced, an editable venv runs this checkout's source, so checking out
-#    the release under a running service would change the code it runs.
+#    Until it is replaced, an editable venv runs the checkout's source, so updating the
+#    checkout under a running service would change the code it runs.
+[ -d "$REPO/.git" ] || gx clone --quiet "$URL" "$REPO"
+cd "$REPO" || die "cannot enter $REPO"
 [ ! -e .venv ] || die ".venv exists: stop the service and move .venv aside first"
-g fetch --tags origin
-g checkout --quiet "v$VERSION"
 
-# 1. The checkout is exactly the release tag on the remote, and nothing else. The service
-#    starts with `python -m signoz_mcp.server` from this directory, and `python -m` puts
-#    the directory first on sys.path, so anything importable here would shadow the
-#    installed package. Python also loads a module from __pycache__ whenever the cached
-#    header's source mtime and size match, and `git status` does not show ignored files,
-#    or tracked files flagged assume-unchanged or skip-worktree. Remove bytecode and tool
-#    caches, then refuse any flagged file and anything left except the venv. A `.env` is
-#    refused too: fastmcp reads it from this directory as configuration.
-find . -path ./.venv -prune -o \( -name __pycache__ -o -name '*.py[co]' \) -print0 \
-  | xargs -0 -r rm -rf --
+# 1. The release, fresh from the network. Everything installed comes from this clone,
+#    never from the checkout: a long-lived checkout's index, config and object store can
+#    all misreport what it holds. The tag's commit is read from the same URL.
+tag=$(gx ls-remote "$URL" "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
+[ -n "$tag" ] || die "tag v$VERSION is not on $URL"
+gx clone --quiet --depth 1 --branch "v$VERSION" "$URL" "$tmp/src"
+[ "$(gx -C "$tmp/src" rev-parse HEAD)" = "$tag" ] || die "fresh clone is not v$VERSION ($tag)"
+
+# 2. The checkout PM2 runs from must be exactly the release too: the service starts with
+#    `python -m signoz_mcp.server` there, and `python -m` puts it first on sys.path, so a
+#    stray module would shadow the installed package. fastmcp also reads a `.env` there.
+#    Move it to the tag, remove bytecode and tool caches, then compare every file with the
+#    fresh clone, byte for byte, in Python: no git status, index or config is trusted.
+gx --git-dir="$REPO/.git" --work-tree="$REPO" fetch --quiet "$URL" "refs/tags/v$VERSION"
+gx --git-dir="$REPO/.git" --work-tree="$REPO" checkout --quiet --detach "$tag"
+find . -path ./.git -prune -o -path ./.venv -prune -o \
+  \( -name __pycache__ -o -name '*.py[co]' \) -print0 | xargs -0 -r rm -rf --
 rm -rf .pytest_cache .ruff_cache .coverage htmlcov build dist ./*.egg-info src/*.egg-info
-flagged=$(g ls-files -v | grep -v '^H ' || true)
-[ -z "$flagged" ] || die "tracked files flagged out of git status; clear the flags first:
-$flagged"
-# Modes on the command line: status.showUntrackedFiles=no would otherwise hide every
-# untracked and ignored path.
-status=$(g status --porcelain --ignored=traditional --untracked-files=normal)
-extra=$(printf '%s\n' "$status" | grep -vxE '(!! \.venv/)?' || true)
-[ -z "$extra" ] || die "checkout holds more than v$VERSION; remove these first:
-$extra"
-# The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
-tag=$(g ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
-[ -n "$tag" ] || die "tag v$VERSION is not on origin"
-[ "$(g rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
+"$PY" -I - "$REPO" "$tmp/src" .venv <<'EOF' || die "checkout differs from v$VERSION; fix the files listed above"
+import os, sys, pathlib
+# argv: <live checkout> <fresh clone> <top-level names to skip in the live checkout>...
+live, ref, skip = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), set(sys.argv[3:])
 
-# 2. Build a fresh venv at the path the service runs from. Pin the interpreter: uv
-#    otherwise prefers a Python it manages itself, which `uv python` can later remove or
-#    replace under a running service. --no-cache: build this project from this tree, not
-#    from a wheel uv cached on an earlier run.
-UV_PROJECT_ENVIRONMENT="$REPO/.venv" \
-  uv sync --frozen --no-editable --no-cache "${EXTRAS[@]}" --python "$PY"
+def entries(root, top_skip):
+    out = {}
+    for d, dirs, files in os.walk(root):
+        rel = pathlib.Path(d).relative_to(root)
+        if rel == pathlib.Path("."):
+            dirs[:] = [x for x in dirs if x not in top_skip]
+            files = [x for x in files if x not in top_skip]
+        for x in [x for x in dirs if (pathlib.Path(d) / x).is_symlink()]:
+            dirs.remove(x)
+            files.append(x)
+        for f in files:
+            out[(rel / f).as_posix()] = pathlib.Path(d) / f
+    return out
 
-# 3. The venv is exactly the lock (no missing, extra or different package), and the
-#    installed package is byte-for-byte the release: build a wheel from the tag's own
-#    objects (`git archive`) and compare it with every file the install recorded (the
-#    dist-info RECORD), wherever in the venv it was written.
-UV_PROJECT_ENVIRONMENT="$REPO/.venv" \
-  uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
+def same(a, b):
+    if a.is_symlink() or b.is_symlink():
+        return a.is_symlink() and b.is_symlink() and os.readlink(a) == os.readlink(b)
+    return a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()
+
+have, want = entries(live, skip | {".git"}), entries(ref, {".git"})
+extra, missing = sorted(have.keys() - want.keys()), sorted(want.keys() - have.keys())
+differ = sorted(k for k in have.keys() & want.keys() if not same(have[k], want[k]))
+if extra or missing or differ:
+    sys.exit(f"extra: {extra}\nmissing: {missing}\ndiffer: {differ}")
+print(f"install: checkout matches the release, {len(want)} files")
+EOF
+
+# 3. Build a fresh venv at the path the service runs from, from the clone's own
+#    pyproject.toml and uv.lock. Pin the interpreter: uv otherwise prefers a Python it
+#    manages itself, which `uv python` can later remove or replace under a running
+#    service. --no-config: no uv.toml outside the project. --no-cache: nothing an earlier
+#    run cached.
+UV_PROJECT_ENVIRONMENT="$REPO/.venv" uv sync --project "$tmp/src" --no-config \
+  --frozen --no-editable --no-cache "${EXTRAS[@]}" --python "$PY"
+
+# 4. The venv is exactly the lock (no missing, extra or different package), and every
+#    file the install recorded (the dist-info RECORD), wherever in the venv it was
+#    written, is byte-for-byte a wheel built from the same clone.
+UV_PROJECT_ENVIRONMENT="$REPO/.venv" uv sync --project "$tmp/src" --no-config \
+  --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
   || die "venv does not match uv.lock"
-mkdir "$tmp/src"
-g archive "$tag" | tar -x -C "$tmp/src"
-uv build --wheel --no-cache --python "$PY" --out-dir "$tmp/dist" "$tmp/src" >/dev/null
+uv build --no-config --wheel --no-cache --python "$PY" --out-dir "$tmp/dist" "$tmp/src" >/dev/null
 .venv/bin/python -I - "$tmp"/dist/*.whl .venv/lib/python3.13/site-packages <<'EOF' \
   || die "installed package differs from the v$VERSION wheel"
 import base64, configparser, csv, hashlib, sys, zipfile, pathlib
@@ -194,7 +221,7 @@ venv keeps whatever older dependency versions it finds there, if they still sati
 declared ranges. Build at the final path rather than building elsewhere and moving it: the
 venv's scripts embed its path. A uv-built venv has no `pip`. Stop the service and move
 its venv aside before running the script (step 0 refuses to run otherwise), and restart it
-after step 3. Set `REPO` if the service runs from somewhere else. Under PM2, restart it by name
+after step 4. Set `REPO` if the service runs from somewhere else. Under PM2, restart it by name
 (`pm2 restart signoz-mcp`): `ecosystem.config.js` reads `SIGNOZ_API_KEY` from the shell that
 first started it, so a `pm2 delete` and `start`, or `--update-env`, from a shell without the
 key loses it.
