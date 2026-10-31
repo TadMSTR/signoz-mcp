@@ -80,12 +80,156 @@ parties can intercept tool calls without editing the server — see
 
 ## Installation
 
+signoz-mcp is not published to PyPI. The script below installs a release tag from a fresh
+clone of it, using that clone's committed `uv.lock`, so the dependency set is the one CI
+tested and audited. The checkout the service runs from is updated to the tag and compared
+with the clone, but nothing is installed from it. The package is
+installed into the venv as a copy (not editable), so the code that runs is the release's,
+and its recorded version is true. Use [uv](https://docs.astral.sh/uv/).
+
+Save this as a script and run it with `bash`. Don't paste it into a shell: every check ends
+the run on failure, and that only works under `set -e` in a script.
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-# with telemetry backends:
-pip install -e ".[telemetry]"
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION=0.5.0
+URL=https://github.com/TadMSTR/signoz-mcp
+# The directory the service runs from: ecosystem.config.js `cwd`.
+REPO=${REPO:-$HOME/repos/personal/signoz-mcp}
+PY=/usr/bin/python3.13
+EXTRAS=(--extra telemetry)   # drop it if no telemetry backend will ever be enabled
+die() { echo "install: $*" >&2; exit 1; }
+tmp=$(mktemp -d) && trap 'rm -rf -- "$tmp"' EXIT
+# Git without the system or global config (no URL rewrites, no hooks, no fsmonitor).
+gx() {
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+}
+
+# 0. Stop the service and move its venv aside (outside the checkout) BEFORE this runs.
+#    Until it is replaced, an editable venv runs the checkout's source, so updating the
+#    checkout under a running service would change the code it runs.
+[ -d "$REPO/.git" ] || gx clone --quiet "$URL" "$REPO"
+cd "$REPO" || die "cannot enter $REPO"
+[ ! -e .venv ] || die ".venv exists: stop the service and move .venv aside first"
+
+# 1. The release, fresh from the network. Everything installed comes from this clone,
+#    never from the checkout: a long-lived checkout's index, config and object store can
+#    all misreport what it holds. The tag's commit is read from the same URL.
+tag=$(gx ls-remote "$URL" "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail -n1 | cut -f1)
+[ -n "$tag" ] || die "tag v$VERSION is not on $URL"
+gx clone --quiet --depth 1 --branch "v$VERSION" "$URL" "$tmp/src"
+[ "$(gx -C "$tmp/src" rev-parse HEAD)" = "$tag" ] || die "fresh clone is not v$VERSION ($tag)"
+
+# 2. The checkout PM2 runs from must be exactly the release too: the service starts with
+#    `python -m signoz_mcp.server` there, and `python -m` puts it first on sys.path, so a
+#    stray module would shadow the installed package. fastmcp also reads a `.env` there.
+#    Move it to the tag, remove bytecode and tool caches, then compare every file with the
+#    fresh clone, byte for byte, in Python: no git status, index or config is trusted.
+gx --git-dir="$REPO/.git" --work-tree="$REPO" fetch --quiet "$URL" "refs/tags/v$VERSION"
+gx --git-dir="$REPO/.git" --work-tree="$REPO" checkout --quiet --detach "$tag"
+find . -path ./.git -prune -o -path ./.venv -prune -o \
+  \( -name __pycache__ -o -name '*.py[co]' \) -print0 | xargs -0 -r rm -rf --
+rm -rf .pytest_cache .ruff_cache .coverage htmlcov build dist ./*.egg-info src/*.egg-info
+"$PY" -I - "$REPO" "$tmp/src" .venv <<'EOF' || die "checkout differs from v$VERSION; fix the files listed above"
+import os, sys, pathlib
+# argv: <live checkout> <fresh clone> <top-level names to skip in the live checkout>...
+live, ref, skip = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), set(sys.argv[3:])
+
+def entries(root, top_skip):
+    out = {}
+    for d, dirs, files in os.walk(root):
+        rel = pathlib.Path(d).relative_to(root)
+        if rel == pathlib.Path("."):
+            dirs[:] = [x for x in dirs if x not in top_skip]
+            files = [x for x in files if x not in top_skip]
+        for x in [x for x in dirs if (pathlib.Path(d) / x).is_symlink()]:
+            dirs.remove(x)
+            files.append(x)
+        for f in files:
+            out[(rel / f).as_posix()] = pathlib.Path(d) / f
+    return out
+
+def same(a, b):
+    if a.is_symlink() or b.is_symlink():
+        return a.is_symlink() and b.is_symlink() and os.readlink(a) == os.readlink(b)
+    return a.is_file() and b.is_file() and a.read_bytes() == b.read_bytes()
+
+have, want = entries(live, skip | {".git"}), entries(ref, {".git"})
+extra, missing = sorted(have.keys() - want.keys()), sorted(want.keys() - have.keys())
+differ = sorted(k for k in have.keys() & want.keys() if not same(have[k], want[k]))
+if extra or missing or differ:
+    sys.exit(f"extra: {extra}\nmissing: {missing}\ndiffer: {differ}")
+print(f"install: checkout matches the release, {len(want)} files")
+EOF
+
+# 3. Build a fresh venv at the path the service runs from, from the clone's own
+#    pyproject.toml and uv.lock. Pin the interpreter: uv otherwise prefers a Python it
+#    manages itself, which `uv python` can later remove or replace under a running
+#    service. --no-config: no uv.toml outside the project. --no-cache: nothing an earlier
+#    run cached.
+UV_PROJECT_ENVIRONMENT="$REPO/.venv" uv sync --project "$tmp/src" --no-config \
+  --frozen --no-editable --no-cache "${EXTRAS[@]}" --python "$PY"
+
+# 4. The venv is exactly the lock (no missing, extra or different package), and every
+#    file the install recorded (the dist-info RECORD), wherever in the venv it was
+#    written, is byte-for-byte a wheel built from the same clone.
+UV_PROJECT_ENVIRONMENT="$REPO/.venv" uv sync --project "$tmp/src" --no-config \
+  --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
+  || die "venv does not match uv.lock"
+uv build --no-config --wheel --no-cache --python "$PY" --out-dir "$tmp/dist" "$tmp/src" >/dev/null
+.venv/bin/python -I - "$tmp"/dist/*.whl .venv/lib/python3.13/site-packages <<'EOF' \
+  || die "installed package differs from the v$VERSION wheel"
+import base64, configparser, csv, hashlib, sys, zipfile, pathlib
+whl, site = zipfile.ZipFile(sys.argv[1]), pathlib.Path(sys.argv[2])
+names = {n for n in whl.namelist() if not n.endswith("/")}
+di = next(n for n in names if n.endswith(".dist-info/RECORD")).rsplit("/", 1)[0]
+# Written by the installer, not shipped in the wheel. Everything else the install wrote
+# is listed in the installed RECORD and must be exactly the wheel's file.
+by_installer = {f"{di}/{x}" for x in ("RECORD", "INSTALLER", "REQUESTED", "direct_url.json", "uv_cache.json", "uv_build.json")}
+eps = configparser.ConfigParser(delimiters=("=",))
+eps.optionxform = str
+eps.read_string(whl.read(f"{di}/entry_points.txt").decode() if f"{di}/entry_points.txt" in names else "")
+scripts = {f"../../../bin/{s}" for s in (eps["console_scripts"] if eps.has_section("console_scripts") else {})}
+record = [r[0] for r in csv.reader((site / di / "RECORD").read_text().splitlines()) if r]
+installed = {p for p in record if p not in by_installer and p not in scripts}
+want = names - by_installer
+missing, extra = sorted(want - installed), sorted(installed - want)
+bad = sorted(n for n in want & installed
+             if not (site / n).is_file() or (site / n).read_bytes() != whl.read(n))
+unlisted = sorted(s for s in record if s.startswith("../") and s not in scripts)
+assert not (missing or extra or bad or unlisted), (
+    f"missing: {missing} extra: {extra} differ: {bad} outside site-packages: {unlisted}")
+print(f"install: all {len(want)} files match the release wheel (RECORD)")
+EOF
+# The package imports from the venv, not from the checkout, when started the way PM2
+# starts it: from this directory. The server refuses to import without SIGNOZ_API_KEY; a
+# placeholder is enough to import.
+SIGNOZ_API_KEY=import-check .venv/bin/python - "$VERSION" <<'EOF' \
+  || die "installed package check failed"
+import importlib.metadata as m, sys, signoz_mcp, signoz_mcp.server
+assert "/site-packages/" in signoz_mcp.__file__, signoz_mcp.__file__
+assert m.version("signoz-mcp") == sys.argv[1], m.version("signoz-mcp")
+print("signoz-mcp", sys.argv[1], "from", signoz_mcp.__file__)
+EOF
+echo "install: signoz-mcp v$VERSION ready; restart the service by name"
 ```
+
+Build a fresh venv rather than installing into an existing one: an install into an existing
+venv keeps whatever older dependency versions it finds there, if they still satisfy the
+declared ranges. Build at the final path rather than building elsewhere and moving it: the
+venv's scripts embed its path. A uv-built venv has no `pip`. Stop the service and move
+its venv aside before running the script (step 0 refuses to run otherwise), and restart it
+after step 4. Set `REPO` if the service runs from somewhere else. Under PM2, restart it by name
+(`pm2 restart signoz-mcp`): `ecosystem.config.js` reads `SIGNOZ_API_KEY` from the shell that
+first started it, so a `pm2 delete` and `start`, or `--update-env`, from a shell without the
+key loses it.
+
+CI audits the locked set on every push and weekly, but nothing reads a scheduled run's
+result unless you watch it, and GitHub disables a public repository's scheduled workflows
+after 60 days without activity. Audit the deployed venv where it runs as well (for example
+`pip-audit --path .venv/lib/python3.13/site-packages`).
 
 ## Running
 
@@ -98,11 +242,11 @@ pm2 start ecosystem.config.js
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-pytest
-pytest --cov=signoz_mcp --cov-report=term-missing
-ruff check .
-ruff format .
+uv sync --frozen --extra dev --extra telemetry
+uv run --frozen --no-sync pytest
+uv run --frozen --no-sync pytest --cov=signoz_mcp --cov-report=term-missing
+uv run --frozen --no-sync ruff check .
+uv run --frozen --no-sync ruff format .
 ```
 
 ## Logs

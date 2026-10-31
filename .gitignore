@@ -9,9 +9,10 @@ htmlcov/
 .pytest_cache/
 .ruff_cache/
 *.core
-core.*
+core.[0-9]*
 .env
 *.env
+.env.*
 
 # Private key material (B6). Distinct from the .env rules above: those catch
 # credentials written as environment files, these catch them written as keys.
