@@ -15,7 +15,12 @@ changed.
   because `python -m` puts the checkout first on `sys.path`), builds a fresh `.venv` with
   `uv sync --frozen --no-editable`, checks the venv against the lock with `uv sync
   --check`, and checks that the package imports from site-packages and reports the
-  release version. Upgrading from 0.4.x means rebuilding the venv this way; `pip install
+  release version. It also refuses tracked files hidden from `git status` (assume-unchanged,
+  skip-worktree) and a `.env` in the checkout, builds without uv's cache, compares every
+  installed package file with a wheel built from the tag (`git archive`), defaults `REPO`
+  to the directory `ecosystem.config.js` runs from, and refuses to start while `.venv`
+  exists, so the checkout cannot change under a running editable install.
+  Upgrading from 0.4.x means rebuilding the venv this way; `pip install
   -e .` into the old venv keeps its old dependency versions.
 
 ### Changed — dependencies

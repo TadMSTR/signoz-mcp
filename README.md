@@ -92,13 +92,19 @@ the run on failure, and that only works under `set -e` in a script.
 #!/usr/bin/env bash
 set -euo pipefail
 VERSION=0.5.0
-REPO=~/repos/signoz-mcp
+# The directory the service runs from: ecosystem.config.js `cwd`.
+REPO=${REPO:-$HOME/repos/personal/signoz-mcp}
 PY=/usr/bin/python3.13
 EXTRAS=(--extra telemetry)   # drop it if no telemetry backend will ever be enabled
 die() { echo "install: $*" >&2; exit 1; }
+tmp=$(mktemp -d) && trap 'rm -rf -- "$tmp"' EXIT
 
 [ -d "$REPO/.git" ] || git clone https://github.com/TadMSTR/signoz-mcp "$REPO"
 cd "$REPO" || die "cannot enter $REPO"
+# 0. Stop the service and move its venv aside (outside the checkout) BEFORE this runs.
+#    Until it is replaced, an editable venv runs this checkout's source, so checking out
+#    the release under a running service would change the code it runs.
+[ ! -e .venv ] || die ".venv exists: stop the service and move .venv aside first"
 git fetch --tags origin
 git checkout --quiet "v$VERSION"
 
@@ -106,14 +112,18 @@ git checkout --quiet "v$VERSION"
 #    starts with `python -m signoz_mcp.server` from this directory, and `python -m` puts
 #    the directory first on sys.path, so anything importable here would shadow the
 #    installed package. Python also loads a module from __pycache__ whenever the cached
-#    header's source mtime and size match, and `git status` does not show ignored files.
-#    Remove bytecode and tool caches, then refuse anything left except the venv and .env
-#    files.
+#    header's source mtime and size match, and `git status` does not show ignored files,
+#    or tracked files flagged assume-unchanged or skip-worktree. Remove bytecode and tool
+#    caches, then refuse any flagged file and anything left except the venv. A `.env` is
+#    refused too: fastmcp reads it from this directory as configuration.
 find . -path ./.venv -prune -o \( -name __pycache__ -o -name '*.py[co]' \) -print0 \
   | xargs -0 -r rm -rf --
 rm -rf .pytest_cache .ruff_cache .coverage htmlcov build dist ./*.egg-info src/*.egg-info
+flagged=$(git ls-files -v | grep -v '^H ' || true)
+[ -z "$flagged" ] || die "tracked files flagged out of git status; clear the flags first:
+$flagged"
 status=$(git status --porcelain --ignored)
-extra=$(printf '%s\n' "$status" | grep -vxE '(!! (\.venv/|\.env|\.env\.[^/]+))?' || true)
+extra=$(printf '%s\n' "$status" | grep -vxE '(!! \.venv/)?' || true)
 [ -z "$extra" ] || die "checkout holds more than v$VERSION; remove these first:
 $extra"
 # The peeled line (^{}) is listed last for an annotated tag; a lightweight tag has one line.
@@ -121,21 +131,38 @@ tag=$(git ls-remote origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}" | tail
 [ -n "$tag" ] || die "tag v$VERSION is not on origin"
 [ "$(git rev-parse HEAD)" = "$tag" ] || die "HEAD is not origin's v$VERSION ($tag)"
 
-# 2. Build a fresh venv at the path the service runs from. Stop the service and move the
-#    old venv aside first (outside the checkout); this refuses to build over one. Pin the
-#    interpreter: uv otherwise prefers a Python it manages itself, which `uv python` can
-#    later remove or replace under a running service.
-[ ! -e .venv ] || die ".venv exists: stop the service and move it aside first"
+# 2. Build a fresh venv at the path the service runs from. Pin the interpreter: uv
+#    otherwise prefers a Python it manages itself, which `uv python` can later remove or
+#    replace under a running service. --no-cache: build this project from this tree, not
+#    from a wheel uv cached on an earlier run.
 UV_PROJECT_ENVIRONMENT="$REPO/.venv" \
-  uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY"
+  uv sync --frozen --no-editable --no-cache "${EXTRAS[@]}" --python "$PY"
 
 # 3. The venv is exactly the lock (no missing, extra or different package), and the
-#    package imports from the venv, not from the checkout, when started the way PM2 starts
-#    it: from this directory.
+#    installed package is byte-for-byte the release: build a wheel from the tag's own
+#    objects (`git archive`) and compare every file with what was installed.
 UV_PROJECT_ENVIRONMENT="$REPO/.venv" \
   uv sync --frozen --no-editable "${EXTRAS[@]}" --python "$PY" --check \
   || die "venv does not match uv.lock"
-# The server refuses to import without SIGNOZ_API_KEY; a placeholder is enough to import.
+mkdir "$tmp/src"
+git archive "$tag" | tar -x -C "$tmp/src"
+uv build --wheel --no-cache --python "$PY" --out-dir "$tmp/dist" "$tmp/src" >/dev/null
+.venv/bin/python -I - "$tmp"/dist/*.whl .venv/lib/python3.13/site-packages <<'EOF' \
+  || die "installed package differs from the v$VERSION wheel"
+import sys, zipfile, pathlib
+whl, site = zipfile.ZipFile(sys.argv[1]), pathlib.Path(sys.argv[2])
+names = [n for n in whl.namelist() if not n.endswith("/") and ".dist-info/" not in n]
+bad = [n for n in names if not (site / n).is_file() or (site / n).read_bytes() != whl.read(n)]
+tops = {n.split("/")[0] for n in names}
+extra = sorted(str(p.relative_to(site)) for t in tops for p in (site / t).rglob("*")
+               if p.is_file() and "__pycache__" not in p.parts
+               and str(p.relative_to(site)) not in names)
+assert not bad and not extra, f"differ: {bad} extra: {extra}"
+print(f"install: {len(names)} files match the release wheel")
+EOF
+# The package imports from the venv, not from the checkout, when started the way PM2
+# starts it: from this directory. The server refuses to import without SIGNOZ_API_KEY; a
+# placeholder is enough to import.
 SIGNOZ_API_KEY=import-check .venv/bin/python - "$VERSION" <<'EOF' \
   || die "installed package check failed"
 import importlib.metadata as m, sys, signoz_mcp, signoz_mcp.server
@@ -143,14 +170,15 @@ assert "/site-packages/" in signoz_mcp.__file__, signoz_mcp.__file__
 assert m.version("signoz-mcp") == sys.argv[1], m.version("signoz-mcp")
 print("signoz-mcp", sys.argv[1], "from", signoz_mcp.__file__)
 EOF
-echo "install: signoz-mcp v$VERSION ready; restart the service"
+echo "install: signoz-mcp v$VERSION ready; restart the service by name"
 ```
 
 Build a fresh venv rather than installing into an existing one: an install into an existing
 venv keeps whatever older dependency versions it finds there, if they still satisfy the
 declared ranges. Build at the final path rather than building elsewhere and moving it: the
-venv's scripts embed its path. A uv-built venv has no `pip`. Stop the service before
-replacing its venv, and restart it after step 3. Under PM2, restart it by name
+venv's scripts embed its path. A uv-built venv has no `pip`. Stop the service and move
+its venv aside before running the script (step 0 refuses to run otherwise), and restart it
+after step 3. Set `REPO` if the service runs from somewhere else. Under PM2, restart it by name
 (`pm2 restart signoz-mcp`): `ecosystem.config.js` reads `SIGNOZ_API_KEY` from the shell that
 first started it, so a `pm2 delete` and `start`, or `--update-env`, from a shell without the
 key loses it.
