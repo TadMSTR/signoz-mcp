@@ -44,8 +44,8 @@ classifiers = [
 #   raised 2026-11-15)
 # - certifi: the SigNoz client loads its CA bundle on every call. forge's SigNoz URL is
 #   plain HTTP, but SIGNOZ_URL can point at HTTPS.
-# - dnspython (2026-11-15): no tool call reaches it, but CVE-2026-128089 (fixed in 2.9.2)
-#   turned up in the installed venv, so it is floored rather than held by the lock alone
+# - dnspython (2026-11-15): no tool call reaches it; floored past CVE-2026-128089 (fixed
+#   in 2.9.2) rather than held by the lock alone
 #
 # uv.lock is the control: it pins every package, and a deploy builds a fresh venv from
 # it. A fresh resolve outside the lock could still pick an older release of these, which
