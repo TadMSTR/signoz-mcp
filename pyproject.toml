@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signoz-mcp"
-version = "0.5.0"
+version = "0.5.1"
 description = "FastMCP server for SigNoz observability queries — read-only access to services, traces, logs, metrics, and alerts"
 readme = "README.md"
 license = "MIT"
@@ -40,15 +40,18 @@ classifiers = [
 # - pyjwt: mcp's auth layer. Not loaded today (no auth provider is configured); floored
 #   so that enabling one cannot pick up an old release
 # - opentelemetry-api: fastmcp parses every tool call's `_meta` trace context with it,
-#   whether or not a telemetry sink is configured
+#   whether or not a telemetry sink is configured. 1.45.2 fixes CVE-2026-126360 (floor
+#   raised 2026-11-15)
 # - certifi: the SigNoz client loads its CA bundle on every call. forge's SigNoz URL is
 #   plain HTTP, but SIGNOZ_URL can point at HTTPS.
+# - dnspython (2026-11-15): no tool call reaches it; floored past CVE-2026-128089 (fixed
+#   in 2.9.2) rather than held by the lock alone
 #
 # uv.lock is the control: it pins every package, and a deploy builds a fresh venv from
 # it. A fresh resolve outside the lock could still pick an older release of these, which
 # no tool call reaches (idna loads, but nothing encodes a non-ASCII host; pygments,
 # pydantic-settings and python-dotenv run at startup or in log rendering only): authlib,
-# cryptography, dnspython, idna, jaraco-context, joserfc, protobuf, pyarrow,
+# cryptography, idna, jaraco-context, joserfc, protobuf, pyarrow,
 # pydantic-settings, pygments, python-dotenv, urllib3.
 dependencies = [
     "fastmcp>=3.4.10,<4.0.0",
@@ -61,8 +64,9 @@ dependencies = [
     "anyio>=4.14.2",
     "h11>=0.16.0",
     "pyjwt>=2.15",
-    "opentelemetry-api>=1.45.1",
+    "opentelemetry-api>=1.45.2",
     "certifi>=2026.10.18",
+    "dnspython>=2.9.2",
 ]
 
 [project.urls]
