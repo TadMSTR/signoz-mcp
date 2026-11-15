@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-15
+
+Dependency release. No application code changed, and no tool signature changed.
+
+### Security
+
+- **dnspython 2.9.2** (CVE-2026-128089). The runtime dependencies now floor
+  `dnspython>=2.9.2` and `uv.lock` pins 2.9.2 (was 2.9.1). No tool call reaches dnspython;
+  the floor keeps a re-resolve from keeping the vulnerable release.
+- **opentelemetry-api floor raised to `>=1.45.2`** (CVE-2026-126360). The lock already
+  pinned 1.45.2; the floor now matches.
+
 ## [0.5.0] — 2026-10-30
 
 Dependency and install-model release. No application code changed, and no tool signature
